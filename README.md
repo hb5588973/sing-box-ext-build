@@ -1,77 +1,77 @@
 # sing-box-ext-build
 
-Builds [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaWG** and
-**MASQUE** support, straight from upstream sources plus the patches in `patches/`.
+> Automated builds of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaWG** and **MASQUE** support.
+> Code comes straight from upstream sources plus a set of lightweight patches.
 
-- This repository contains **no sing-box source code**.
-- `main` holds only `patches/` and `.github/workflows/`.
-- The AmneziaWG fork of `sagernet/wireguard-go` lives in a separate repository,
-  [`hb5588973/wireguard-go-awg`](https://github.com/hb5588973/wireguard-go-awg)
-  (a build dependency, cloned by CI, not sing-box code).
+[![Build Status](https://github.com/hb5588973/sing-box-ext-build/actions/workflows/build.yml/badge.svg)](https://github.com/hb5588973/sing-box-ext-build/actions/workflows/build.yml)
 
-## What a build does
+## Features
 
-1. clones `SagerNet/sing-box@testing` (latest);
-2. clones `hb5588973/wireguard-go-awg@main` into
-   `src/submodules/wireguard-go` (the local module `go.mod` replacement);
-3. applies every `patches/*.patch` with `git apply --check` first — a conflict stops
-   the run with `::error::`;
-4. computes the build tags **from upstream**:
-   `src/release/DEFAULT_BUILD_TAGS_OTHERS` + `,with_awg`;
-5. builds `linux/amd64`, `darwin/arm64`, `windows/amd64` with `CGO_ENABLED=0`,
-   using upstream's own `release/LDFLAGS` (which includes `-checklinkname=0`,
-   required by the `badlinkname` / `tfogo_checklinkname0` tags);
-6. updates the rolling `latest` release with the three binaries.
+- **No sing-box source code** is stored in this repository.
+- Contains only `patches/` and `.github/workflows/`.
+- Fetches the latest `testing` branch from upstream every day.
+- Applies patches and builds binaries cross-platform with `CGO_ENABLED=0`.
+- Automatically tracks official upstream build tags (never hard-coded).
+- AmneziaWG support is added via `with_awg` tag.
+- MASQUE CONNECT-IP outbound is compiled unconditionally (requires no build tag).
 
 ## Download
 
-Latest release: <https://github.com/hb5588973/sing-box-ext-build/releases/latest>
+Latest pre-built binaries: 
+👉 **[Download Latest Release](https://github.com/hb5588973/sing-box-ext-build/releases/latest)**
 
-## Build tags
+Available platforms: `linux-amd64`, `linux-arm64`, `linux-armv7`, `linux-armv6`, `linux-riscv64`, `linux-mipsle`, `linux-mips`, `linux-mips64le`, `linux-mips64`, `darwin-arm64`, `windows-amd64`.
 
-The tag set is never hard-coded: `release/DEFAULT_BUILD_TAGS_OTHERS` is read from the
-cloned upstream tree, so official tag changes are followed automatically. Only
-`with_awg` is appended.
+## How to Fork & Build Your Own
 
-MASQUE has **no build tag** — the outbound is compiled unconditionally; the workflow
-asserts its sources are present instead of asserting a `with_masque` tag (which does
-not exist).
+If you want to use this approach for your own fork:
 
-`with_naive_outbound` is intentionally absent: it links `sagernet/cronet-go` and
-requires a cgo toolchain per platform, which conflicts with CGO-free cross builds.
-Official macOS releases enable it; these builds do not.
+1. **Fork this repository** (e.g., `yourname/sing-box-ext-build`).
+2. **Fork the wireguard-go fork** (e.g., `yourname/wireguard-go-awg`) if you have custom AWG changes. *If you don't want to fork it, modify the `WIREGUARD_REPO` env in `.github/workflows/build.yml` to point to the original `hb5588973/wireguard-go-awg`.*
+3. The GitHub Actions workflow is pre-configured. You just need to trigger it:
+   - Go to the **Actions** tab.
+   - Select **build**.
+   - Click **Run workflow**.
 
-## Manual trigger
+The workflow will automatically:
+1. Clone `SagerNet/sing-box@testing`.
+2. Clone `wireguard-go-awg` into `src/submodules/wireguard-go` (local module replacement).
+3. Apply `patches/*.patch` (`git apply --check` fails fast on conflicts).
+4. Read `src/release/DEFAULT_BUILD_TAGS_OTHERS` from upstream, append `with_awg`.
+5. Build with `CGO_ENABLED=0` using upstream's `release/LDFLAGS`.
+6. Publish binaries to the rolling `latest` release.
 
-Actions → **build** → *Run workflow*. It also runs daily at 03:00 UTC and on pushes
-that touch `patches/**` or the workflow file.
+## Build Tags & MASQUE
 
-## When upstream changes break a patch
+The tag set is never hard-coded: `release/DEFAULT_BUILD_TAGS_OTHERS` is read from the cloned upstream tree. Only `with_awg` is appended.
+
+MASQUE has **no build tag** — the outbound is compiled unconditionally; the workflow asserts its sources are present instead of asserting a non-existent `with_masque` tag.
+
+`with_naive_outbound` is intentionally absent: it links `sagernet/cronet-go` and requires a cgo toolchain per platform, which conflicts with CGO-free cross builds. Official macOS releases enable it; these builds do not.
+
+## Maintenance: When upstream changes break a patch
+
+If the scheduled CI run fails because upstream changed something that conflicts with our patches:
 
 ```bash
-# 1. update the working copy (D:\Tools\vpn\sing-box), branch testing
-git fetch origin
-git rebase origin/testing          # resolve conflicts here, keep changes minimal
-go build ./... && go test ./transport/masque/...
+# 1. Clone your fork locally and rebase against upstream
+git clone https://github.com/YOUR_NAME/sing-box-ext-build.git
+cd sing-box-ext-build
 
-# 2. re-export patches (LF endings — do not use PowerShell redirection)
-cd D:\Tools\vpn\sing-box
-git diff --no-color origin/testing..HEAD -- go.mod option/wireguard.go option/wireguard_awg.go \
-  protocol/wireguard/endpoint.go transport/wireguard/endpoint.go transport/wireguard/endpoint_options.go \
-  transport/wireguard/device_awg.go transport/wireguard/device_stub_awg.go \
-  > D:\Tools\vpn\sb-build\patches\0001-amneziawg.patch
-git diff --no-color origin/testing..HEAD -- constant/proxy.go include/registry.go \
-  option/masque_outbound.go protocol/masque transport/masque > D:\Tools\vpn\sb-build\patches\0002-masque-outbound.patch
+# 2. Create a temporary working tree to apply and resolve patches
+mkdir work && cd work
+git clone --depth 1 --branch testing https://github.com/SagerNet/sing-box.git
+cd sing-box
+# Apply your patches one by one
+git apply ../../patches/0001-amneziawg.patch
+# If conflicts occur, fix them, then generate a new patch:
+git diff > ../../patches/0001-amneziawg.patch
 
-# 3. verify against a clean upstream tree
-git worktree add ../sb-apply origin/testing --detach
-cd ../sb-apply && git apply --check D:\Tools\vpn\sb-build\patches\*.patch
-
-# 4. commit + push (CI rebuilds automatically)
-```
-
-If a conflict needs more than mechanical resolution, stop and inspect: the patches are
-deliberately small and readable.
+# 3. Push the updated patches back to your fork
+cd ../..
+git add patches/
+git commit -m "fix: update patches for upstream changes"
+git push
 
 ## Layout
 

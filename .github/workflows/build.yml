@@ -96,7 +96,6 @@ jobs:
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
           FINAL_TAGS="${BASE_TAGS},with_awg"
           
-          # 根据 matrix 中的 naive 字段判断是否追加
           if [ "${{ matrix.naive }}" = "true" ]; then
             FINAL_TAGS="${FINAL_TAGS},with_naive_outbound,with_purego"
           fi
@@ -115,11 +114,22 @@ jobs:
           mkdir -p dist
           cd src
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
+          # 强制剥离动态链接参数（如果有的话），并保持 -s -w
           go build -v -trimpath \
             -tags "${FINAL_TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w -linkmode internal -extldflags '-static'" \
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
+          
+          # 强力验证：如果 Linux 编译出来不是静态的，直接报错阻断
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            FILE_INFO=$(file "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}")
+            echo "File info: $FILE_INFO"
+            if ! echo "$FILE_INFO" | grep -q "statically linked"; then
+              echo "::error::BUILD FAILED! Linux binary is not statically linked."
+              exit 1
+            fi
+          fi
 
       - name: Package Linux binaries
         run: |
@@ -163,7 +173,7 @@ jobs:
             Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`).
             
             **Includes:** AmneziaWG (`with_awg`), MASQUE CONNECT-IP.
-            **NaiveProxy (`with_naive_outbound`)**: Included for mainstream Linux, macOS, and Windows. Excluded for MIPS architectures due to missing upstream `quic-go` and `purego` support.
+            **NaiveProxy (`with_naive_outbound`)**: Included for mainstream Linux, macOS, and Windows.
             
             Linux binaries are pure static (CGO disabled) and packed in `.tar.gz`.
           files: |

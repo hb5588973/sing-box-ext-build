@@ -3,7 +3,6 @@ name: build
 on:
   workflow_dispatch:
   schedule:
-    # daily at 03:00 UTC
     - cron: "0 3 * * *"
   push:
     paths:
@@ -60,7 +59,7 @@ jobs:
           - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64,    naive: "true" }
           - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe, naive: "true" }
           
-          # === 路由器/小众架构：剔除 NaiveProxy 以保证编译通过 ===
+          # === 路由器/小众架构：剔除 NaiveProxy ===
           - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6,     naive: "false" }
           - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64,   naive: "false" }
           - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat, naive: "false" }
@@ -82,7 +81,6 @@ jobs:
           git clone --depth 1 --branch "$WIREGUARD_BRANCH" \
             "$WIREGUARD_REPO" \
             "$WIREGUARD_PATH"
-          git -C "$WIREGUARD_PATH" log --oneline -1
 
       - name: Apply patches
         run: |
@@ -90,24 +88,10 @@ jobs:
           cd src
           shopt -s nullglob
           patches=("$GITHUB_WORKSPACE"/patches/*.patch)
-          if [ ${#patches[@]} -eq 0 ]; then
-            echo "::error::no patches found"
-            exit 1
-          fi
           for patch in "${patches[@]}"; do
-            echo "::group::apply $(basename "$patch")"
             git apply --check "$patch"
             git apply "$patch"
-            echo "::endgroup::"
           done
-
-      - name: Assert masque sources are present
-        run: |
-          set -euo pipefail
-          test -f src/protocol/masque/outbound.go
-          test -f src/transport/masque/connectip/connectip.go
-          grep -q 'TypeMASQUE' src/constant/proxy.go
-          grep -q 'masque.RegisterOutbound' src/include/registry.go
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -121,12 +105,9 @@ jobs:
           set -euo pipefail
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
           FINAL_TAGS="${BASE_TAGS},with_awg"
-          
           if [ "${{ matrix.naive }}" = "true" ]; then
             FINAL_TAGS="${FINAL_TAGS},with_naive_outbound,with_purego"
           fi
-          
-          echo "BASE_TAGS=${BASE_TAGS}" >> "$GITHUB_ENV"
           echo "FINAL_TAGS=${FINAL_TAGS}" >> "$GITHUB_ENV"
 
       - name: Build
@@ -148,34 +129,23 @@ jobs:
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
 
-      # === 新增：UPX 压缩与 YAT 打包 ===
-      - name: UPX Compress and Package
+      # === 仅做 tar.gz 打包，不执行 UPX -9 ===
+      - name: Package for Release
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/dist"
           BIN="sing-box-${{ matrix.name }}"
-          
-          # 1. 尝试 UPX 压缩（UPX 不支持部分小众架构，失败则跳过不报错）
-          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" != "mips64" ] && [ "${{ matrix.goarch }}" != "mips64le" ] && [ "${{ matrix.goarch }}" != "riscv64" ]; then
-            echo "Running UPX on $BIN..."
-            sudo apt-get update && sudo apt-get install -y upx
-            upx -9 "$BIN" || echo "UPX compression failed or unsupported, continuing with original binary."
-          fi
-
-          # 2. 压缩成 .yat.gz (即 tar.gz)
-          # 如果是 Windows 产物，不进行 YAT 打包；如果是 Linux，执行 tar.gz 并改名为 .yat
           if [ "${{ matrix.goos }}" = "linux" ]; then
-            echo "Packaging $BIN to YAT..."
-            tar -czvf "sing-box-${{ matrix.name }}.yat.gz" "$BIN"
+            tar -czvf "${BIN}.yat.gz" "$BIN"
+            rm "$BIN" # 删除原始二进制，防止误下载到未打包的文件
           fi
 
-      - name: Upload binary
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: sing-box-${{ matrix.name }}
           path: |
-            dist/sing-box-${{ matrix.name }}
-            dist/sing-box-${{ matrix.name }}.yat.gz
+            dist/*
           if-no-files-found: error
 
   release:
@@ -194,9 +164,6 @@ jobs:
           cd dist
           sha256sum * > SHA256SUMS
 
-      - name: List binaries
-        run: ls -l dist
-
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -204,14 +171,10 @@ jobs:
           name: latest build
           make_latest: true
           body: |
-            Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`) with
-            AmneziaWG (`with_awg`) and MASQUE CONNECT-IP (untagged).
-
-            **Supported Features by Platform:**
-            - Linux amd64, arm64, armv7, macOS arm64, Windows amd64: NaiveProxy enabled.
-            - Linux armv6, riscv64, mipsle, mips, mips64le, mips64: NaiveProxy disabled.
-
-            Binaries are packed as `.yat.gz` (tar.gz) for Linux where applicable.
+            Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`) with AmneziaWG and MASQUE.
+            **Linux users:** Download the `.yat.gz` archive, extract it, and run the binary inside.
+            **Windows users:** Download `.exe`.
           files: |
             dist/sing-box-*
+            dist/SHA256SUMS
           prerelease: false

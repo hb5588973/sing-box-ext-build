@@ -1,0 +1,188 @@
+name: build
+
+on:
+  workflow_dispatch:
+  schedule:
+    # daily at 03:00 UTC
+    - cron: "0 3 * * *"
+  push:
+    paths:
+      - "patches/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UPSTREAM_REPO: https://github.com/SagerNet/sing-box.git
+  UPSTREAM_BRANCH: testing
+  # The AmneziaWG wireguard-go fork lives on this branch of this repository.
+  WIREGUARD_BRANCH: wireguard-go
+  WIREGUARD_PATH: src/submodules/wireguard-go
+
+jobs:
+  meta:
+    name: Resolve upstream revision and tags
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_sha: ${{ steps.meta.outputs.upstream_sha }}
+      base_tags: ${{ steps.meta.outputs.base_tags }}
+    steps:
+      - name: Read upstream revision and default tags
+        id: meta
+        run: |
+          set -euo pipefail
+          SHA="$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)"
+          BASE_TAGS="$(curl -fsSL "https://raw.githubusercontent.com/SagerNet/sing-box/$UPSTREAM_BRANCH/release/DEFAULT_BUILD_TAGS_OTHERS")"
+          test -n "$SHA"
+          test -n "$BASE_TAGS"
+          echo "upstream_sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "base_tags=$BASE_TAGS" >> "$GITHUB_OUTPUT"
+          echo "upstream: $SHA"
+          echo "official default tags: $BASE_TAGS"
+
+  build:
+    name: build ${{ matrix.name }}
+    needs: meta
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, name: linux-amd64 }
+          - { goos: darwin,  goarch: arm64, name: darwin-arm64 }
+          - { goos: windows, goarch: amd64, name: windows-amd64.exe }
+    steps:
+      - name: Checkout patch repository
+        uses: actions/checkout@v4
+
+      - name: Clone upstream sing-box
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" src
+
+      - name: Clone AmneziaWG wireguard-go fork
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$WIREGUARD_BRANCH" \
+            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            "$WIREGUARD_PATH"
+          git -C "$WIREGUARD_PATH" log --oneline -1
+
+      - name: Apply patches
+        run: |
+          set -euo pipefail
+          cd src
+          shopt -s nullglob
+          patches=("$GITHUB_WORKSPACE"/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "::error::no patches found"
+            exit 1
+          fi
+          for patch in "${patches[@]}"; do
+            echo "::group::apply $(basename "$patch")"
+            git apply --check "$patch"
+            git apply "$patch"
+            echo "::endgroup::"
+          done
+
+      - name: Assert masque sources are present
+        run: |
+          set -euo pipefail
+          # masque has no build tag: the code is compiled unconditionally, so the
+          # only meaningful assertion is that the patch added it.
+          test -f src/protocol/masque/outbound.go
+          test -f src/transport/masque/connectip/connectip.go
+          grep -q 'TypeMASQUE' src/constant/proxy.go
+          grep -q 'masque.RegisterOutbound' src/include/registry.go
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: src/go.mod
+          cache: true
+          cache-dependency-path: src/go.sum
+
+      - name: Compute build tags
+        run: |
+          set -euo pipefail
+          BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
+          FINAL_TAGS="${BASE_TAGS},with_awg"
+          echo "official default tags: ${BASE_TAGS}"
+          echo "final tags:           ${FINAL_TAGS}"
+          echo "BASE_TAGS=${BASE_TAGS}" >> "$GITHUB_ENV"
+          echo "FINAL_TAGS=${FINAL_TAGS}" >> "$GITHUB_ENV"
+
+      - name: Assert build tags
+        run: |
+          set -euo pipefail
+          echo "FINAL_TAGS=${FINAL_TAGS}"
+          case ",${FINAL_TAGS}," in
+            *,with_awg,*) ;;
+            *) echo "::error::missing with_awg"; exit 1 ;;
+          esac
+          case ",${FINAL_TAGS}," in
+            *,with_wireguard,*) ;;
+            *) echo "::error::with_wireguard missing from the official default set"; exit 1 ;;
+          esac
+          # masque is untagged (verified in the patch); do not require with_masque.
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cd src
+          go build -v -trimpath \
+            -tags "${FINAL_TAGS}" \
+            -ldflags "-s -w -X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}'" \
+            -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
+            ./cmd/sing-box
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ matrix.name }}
+          path: dist/sing-box-${{ matrix.name }}
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: [meta, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List binaries
+        run: ls -l dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: build-${{ github.run_number }}
+          body: |
+            Automated build of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) `${{ needs.meta.outputs.upstream_sha }}` (`testing`) with:
+
+            - AmneziaWG 2.0/3.x (`with_awg`)
+            - MASQUE CONNECT-IP outbound (untagged, always compiled)
+
+            Build tags:
+
+            ```
+            ${{ needs.meta.outputs.base_tags }},with_awg
+            ```
+
+            Binaries are CGO-free (`CGO_ENABLED=0`); `with_naive_outbound` is not included (it requires the cronet toolchain).
+          files: dist/*

@@ -213,6 +213,6 @@ jobs:
 
             Updated by run ${{ github.run_number }} on ${{ github.run_started_at }}.
           files: |
-            dist/*
+            dist/sing-box-*
             dist/SHA256SUMS
           prerelease: false

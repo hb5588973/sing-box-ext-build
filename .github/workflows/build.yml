@@ -53,9 +53,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { goos: linux,   goarch: amd64, name: linux-amd64 }
-          - { goos: darwin,  goarch: arm64, name: darwin-arm64 }
-          - { goos: windows, goarch: amd64, name: windows-amd64.exe }
+          # Linux
+          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64 }
+          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64 }
+          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7 }
+          - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6 }
+          - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64 }
+          - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat }
+          - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat }
+          - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat }
+          - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat }
+          # macOS / Windows
+          - { goos: darwin,  goarch: arm64, goarm: "", name: darwin-arm64 }
+          - { goos: windows, goarch: amd64, goarm: "", name: windows-amd64.exe }
     steps:
       - name: Checkout patch repository
         uses: actions/checkout@v4
@@ -93,8 +103,6 @@ jobs:
       - name: Assert masque sources are present
         run: |
           set -euo pipefail
-          # masque has no build tag: the code is compiled unconditionally, so the
-          # only meaningful assertion is that the patch added it.
           test -f src/protocol/masque/outbound.go
           test -f src/transport/masque/connectip/connectip.go
           grep -q 'TypeMASQUE' src/constant/proxy.go
@@ -129,19 +137,19 @@ jobs:
             *,with_wireguard,*) ;;
             *) echo "::error::with_wireguard missing from the official default set"; exit 1 ;;
           esac
-          # masque is untagged (verified in the patch); do not require with_masque.
 
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          GOMIPS: ${{ matrix.gomips }}
+          GOMIPS64: ${{ matrix.gomips64 }}
           CGO_ENABLED: "0"
         run: |
           set -euo pipefail
           mkdir -p dist
           cd src
-          # Official linker flags: the `badlinkname`/`tfogo_checklinkname0`
-          # tags only link with -checklinkname=0 (release/LDFLAGS).
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
           go build -v -trimpath \
             -tags "${FINAL_TAGS}" \
@@ -167,6 +175,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS
+
       - name: List binaries
         run: ls -l dist
 
@@ -181,11 +194,14 @@ jobs:
             AmneziaWG (`with_awg`) and MASQUE CONNECT-IP (untagged, always compiled).
 
             Build tags:
-            ```
             ${{ needs.meta.outputs.base_tags }},with_awg
-            ```
+
             CGO-free; `with_naive_outbound` is not included.
 
-            Updated by run ${{ github.run_number }} on ${{ github.event.repository.updated_at }}.
-          files: dist/*
+            Platforms: linux-{amd64,arm64,armv7,armv6,riscv64,mipsle,mips,mips64le,mips64}, darwin-arm64, windows-amd64.
+
+            Updated by run ${{ github.run_number }} on ${{ github.run_started_at }}.
+          files: |
+            dist/*
+            dist/SHA256SUMS
           prerelease: false

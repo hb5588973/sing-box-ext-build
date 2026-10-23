@@ -5,24 +5,25 @@ Builds [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaW
 
 - This repository contains **no sing-box source code**.
 - `main` holds only `patches/` and `.github/workflows/`.
-- The `wireguard-go` branch holds the AmneziaWG fork of `sagernet/wireguard-go`
+- The AmneziaWG fork of `sagernet/wireguard-go` lives in a separate repository,
+  [`hb5588973/wireguard-go-awg`](https://github.com/hb5588973/wireguard-go-awg)
   (a build dependency, cloned by CI, not sing-box code).
 
 ## What a build does
 
 1. clones `SagerNet/sing-box@testing` (latest);
-2. clones the `wireguard-go` branch of this repository into
+2. clones `hb5588973/wireguard-go-awg@main` into
    `src/submodules/wireguard-go` (the local module `go.mod` replacement);
 3. applies every `patches/*.patch` with `git apply --check` first — a conflict stops
    the run with `::error::`;
 4. computes the build tags **from upstream**:
    `src/release/DEFAULT_BUILD_TAGS_OTHERS` + `,with_awg`;
 5. builds `linux/amd64`, `darwin/arm64`, `windows/amd64` with `CGO_ENABLED=0`;
-6. publishes `build-<run_number>` with the three binaries.
+6. updates the rolling `latest` release with the three binaries.
 
 ## Download
 
-Releases: <https://github.com/hb5588973/sing-box-ext-build/releases>
+Latest release: <https://github.com/hb5588973/sing-box-ext-build/releases/latest>
 
 ## Build tags
 
@@ -62,7 +63,7 @@ git diff --no-color origin/testing..HEAD -- constant/proxy.go include/registry.g
 
 # 3. verify against a clean upstream tree
 git worktree add ../sb-apply origin/testing --detach
-cd ../sb-apply && git apply --check ../sing-box/patches/*.patch
+cd ../sb-apply && git apply --check D:\Tools\vpn\sb-build\patches\*.patch
 
 # 4. commit + push (CI rebuilds automatically)
 ```

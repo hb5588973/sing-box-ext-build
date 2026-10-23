@@ -20,8 +20,8 @@ concurrency:
 env:
   UPSTREAM_REPO: https://github.com/SagerNet/sing-box.git
   UPSTREAM_BRANCH: testing
-  # The AmneziaWG wireguard-go fork lives on this branch of this repository.
-  WIREGUARD_BRANCH: wireguard-go
+  WIREGUARD_REPO: https://github.com/hb5588973/wireguard-go-awg.git
+  WIREGUARD_BRANCH: main
   WIREGUARD_PATH: src/submodules/wireguard-go
 
 jobs:
@@ -69,7 +69,7 @@ jobs:
         run: |
           set -euo pipefail
           git clone --depth 1 --branch "$WIREGUARD_BRANCH" \
-            "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git" \
+            "$WIREGUARD_REPO" \
             "$WIREGUARD_PATH"
           git -C "$WIREGUARD_PATH" log --oneline -1
 
@@ -170,19 +170,19 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: build-${{ github.run_number }}
-          name: build-${{ github.run_number }}
+          tag_name: latest
+          name: latest build
+          make_latest: true
           body: |
-            Automated build of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) `${{ needs.meta.outputs.upstream_sha }}` (`testing`) with:
-
-            - AmneziaWG 2.0/3.x (`with_awg`)
-            - MASQUE CONNECT-IP outbound (untagged, always compiled)
+            Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`) with
+            AmneziaWG (`with_awg`) and MASQUE CONNECT-IP (untagged, always compiled).
 
             Build tags:
-
             ```
             ${{ needs.meta.outputs.base_tags }},with_awg
             ```
+            CGO-free; `with_naive_outbound` is not included.
 
-            Binaries are CGO-free (`CGO_ENABLED=0`); `with_naive_outbound` is not included (it requires the cronet toolchain).
+            Updated by run ${{ github.run_number }} on ${{ github.event.repository.updated_at }}.
           files: dist/*
+          prerelease: false

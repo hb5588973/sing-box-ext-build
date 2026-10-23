@@ -48,22 +48,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # === Linux 主流/ARM 架构（纯静态，带 Naive） ===
-          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64,     naive: "true" }
-          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64,     naive: "true" }
-          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7,     naive: "true" }
-          - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6,     naive: "true" }
-          - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64,   naive: "true" }
-          
-          # === Linux MIPS 架构（不支持 Naive/purego，仅保留 AWG） ===
-          - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat, naive: "false" }
-          - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat, naive: "false" }
-          - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat, naive: "false" }
-          - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat, naive: "false" }
+          # === 全部的 Linux 架构（纯净静态编译） ===
+          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64 }
+          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64 }
+          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7 }
+          - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6 }
+          - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64 }
+          - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat }
+          - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat }
+          - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat }
+          - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat }
           
           # === Windows / macOS ===
-          - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64,    naive: "true" }
-          - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe, naive: "true" }
+          - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64 }
+          - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe }
     steps:
       - name: Checkout patch repository
         uses: actions/checkout@v4
@@ -95,11 +93,6 @@ jobs:
         run: |
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
           FINAL_TAGS="${BASE_TAGS},with_awg"
-          
-          if [ "${{ matrix.naive }}" = "true" ]; then
-            FINAL_TAGS="${FINAL_TAGS},with_naive_outbound,with_purego"
-          fi
-          
           echo "FINAL_TAGS=${FINAL_TAGS}" >> "$GITHUB_ENV"
 
       - name: Build
@@ -114,14 +107,13 @@ jobs:
           mkdir -p dist
           cd src
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
-          # 强制剥离动态链接参数（如果有的话），并保持 -s -w
           go build -v -trimpath \
             -tags "${FINAL_TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w -linkmode internal -extldflags '-static'" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w" \
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
           
-          # 强力验证：如果 Linux 编译出来不是静态的，直接报错阻断
+          # 验证是否为静态链接
           if [ "${{ matrix.goos }}" = "linux" ]; then
             FILE_INFO=$(file "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}")
             echo "File info: $FILE_INFO"
@@ -136,7 +128,8 @@ jobs:
           cd "$GITHUB_WORKSPACE/dist"
           BIN="sing-box-${{ matrix.name }}"
           if [ "${{ matrix.goos }}" = "linux" ]; then
-            tar -czvf "${BIN}.tar.gz" "$BIN"
+            # 加上 run_number 强制防代理缓存
+            tar -czvf "${BIN}-r${{ github.run_number }}.tar.gz" "$BIN"
             rm "$BIN"
           fi
 
@@ -173,7 +166,6 @@ jobs:
             Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`).
             
             **Includes:** AmneziaWG (`with_awg`), MASQUE CONNECT-IP.
-            **NaiveProxy (`with_naive_outbound`)**: Included for mainstream Linux, macOS, and Windows.
             
             Linux binaries are pure static (CGO disabled) and packed in `.tar.gz`.
           files: |

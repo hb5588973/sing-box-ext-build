@@ -119,7 +119,7 @@ jobs:
         run: |
           set -euo pipefail
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
-          FINAL_TAGS="${BASE_TAGS},with_awg"
+          FINAL_TAGS="${BASE_TAGS},with_awg,with_naive_outbound"
           echo "official default tags: ${BASE_TAGS}"
           echo "final tags:           ${FINAL_TAGS}"
           echo "BASE_TAGS=${BASE_TAGS}" >> "$GITHUB_ENV"
@@ -132,6 +132,10 @@ jobs:
           case ",${FINAL_TAGS}," in
             *,with_awg,*) ;;
             *) echo "::error::missing with_awg"; exit 1 ;;
+          esac
+          case ",${FINAL_TAGS}," in
+            *,with_naive_outbound,*) ;;
+            *) echo "::error::missing with_naive_outbound"; exit 1 ;;
           esac
           case ",${FINAL_TAGS}," in
             *,with_wireguard,*) ;;
@@ -191,12 +195,12 @@ jobs:
           make_latest: true
           body: |
             Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`) with
-            AmneziaWG (`with_awg`) and MASQUE CONNECT-IP (untagged, always compiled).
+            AmneziaWG (`with_awg`), MASQUE CONNECT-IP (untagged), and NaiveProxy (`with_naive_outbound`).
 
             Build tags:
-            ${{ needs.meta.outputs.base_tags }},with_awg
+            ${{ needs.meta.outputs.base_tags }},with_awg,with_naive_outbound
 
-            CGO-free; `with_naive_outbound` is not included.
+            CGO-free builds.
 
             Platforms: linux-{amd64,arm64,armv7,armv6,riscv64,mipsle,mips,mips64le,mips64}, darwin-arm64, windows-amd64.
 

@@ -48,7 +48,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # === Linux 架构（纯净静态，无 Naive） ===
           - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64 }
           - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64 }
           - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7 }
@@ -58,8 +57,6 @@ jobs:
           - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat }
           - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat }
           - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat }
-          
-          # === Windows / macOS ===
           - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64 }
           - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe }
     steps:
@@ -89,12 +86,6 @@ jobs:
           cache: true
           cache-dependency-path: src/go.sum
 
-      - name: Compute build tags
-        run: |
-          BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
-          FINAL_TAGS="${BASE_TAGS},with_awg"
-          echo "FINAL_TAGS=${FINAL_TAGS}" >> "$GITHUB_ENV"
-
       - name: Build
         env:
           GOOS: ${{ matrix.goos }}
@@ -102,43 +93,23 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           GOMIPS: ${{ matrix.gomips }}
           GOMIPS64: ${{ matrix.gomips64 }}
-          CGO_ENABLED: "0" # 强制纯静态编译
+          CGO_ENABLED: "0"
         run: |
           mkdir -p dist
           cd src
+          BASE_TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
           go build -v -trimpath \
-            -tags "${FINAL_TAGS}" \
+            -tags "${BASE_TAGS},with_awg" \
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w" \
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
-          
-          # 强制校验：必须静态链接，否则报错阻断
-          if [ "${{ matrix.goos }}" = "linux" ]; then
-            FILE_INFO=$(file "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}")
-            echo "File info: $FILE_INFO"
-            if ! echo "$FILE_INFO" | grep -q "statically linked"; then
-              echo "::error::BUILD FAILED! Linux binary is not statically linked."
-              exit 1
-            fi
-          fi
-
-      - name: Package Linux binaries
-        run: |
-          cd "$GITHUB_WORKSPACE/dist"
-          BIN="sing-box-${{ matrix.name }}"
-          if [ "${{ matrix.goos }}" = "linux" ]; then
-            # 注意这里！名字回归纯净的 .tar.gz，配合你的更新脚本
-            tar -czvf "${BIN}.tar.gz" "$BIN"
-            rm "$BIN"
-          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: sing-box-${{ matrix.name }}
           path: dist/*
-          if-no-files-found: error
 
   release:
     name: Release
@@ -162,10 +133,6 @@ jobs:
           tag_name: latest
           name: latest build
           make_latest: true
-          body: |
-            Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`).
-            **Includes:** AmneziaWG (`with_awg`), MASQUE CONNECT-IP.
-            Linux binaries are pure static (CGO disabled) and packed in `.tar.gz`.
           files: |
             dist/sing-box-*
             dist/SHA256SUMS

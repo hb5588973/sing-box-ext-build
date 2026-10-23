@@ -48,20 +48,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # === Linux 架构（纯静态，无 CGO，无 Naive） ===
-          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64,     naive: "false" }
-          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64,     naive: "false" }
-          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7,     naive: "false" }
-          - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6,     naive: "false" }
-          - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64,   naive: "false" }
-          - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat, naive: "false" }
-          - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat, naive: "false" }
-          - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat, naive: "false" }
-          - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat, naive: "false" }
+          # === Linux 架构（纯静态，CGO=0，带 Naive） ===
+          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64 }
+          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64 }
+          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7 }
+          - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6 }
+          - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64 }
+          - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat }
+          - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat }
+          - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat }
+          - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat }
           
-          # === Windows / macOS（保留 Naive 支持） ===
-          - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64,    naive: "true" }
-          - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe, naive: "true" }
+          # === Windows / macOS ===
+          - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64 }
+          - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe }
     steps:
       - name: Checkout patch repository
         uses: actions/checkout@v4
@@ -92,10 +92,8 @@ jobs:
       - name: Compute build tags
         run: |
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
-          FINAL_TAGS="${BASE_TAGS},with_awg"
-          if [ "${{ matrix.naive }}" = "true" ]; then
-            FINAL_TAGS="${FINAL_TAGS},with_naive_outbound,with_purego"
-          fi
+          # 统一加上 purego 以实现无 CGO 的 Naive 支持
+          FINAL_TAGS="${BASE_TAGS},with_awg,with_naive_outbound,with_purego"
           echo "FINAL_TAGS=${FINAL_TAGS}" >> "$GITHUB_ENV"
 
       - name: Build
@@ -157,10 +155,8 @@ jobs:
           body: |
             Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`).
             
-            **Included:** AmneziaWG (`with_awg`), MASQUE CONNECT-IP (untagged).
-            **Platform Support:**
-            - **Linux:** Pure static (CGO disabled, no NaiveProxy). Download `.tar.gz`, extract, and run. Perfect for OpenWrt/ImmortalWrt.
-            - **Windows / macOS:** NaiveProxy enabled.
+            **Includes:** AmneziaWG (`with_awg`), MASQUE CONNECT-IP, NaiveProxy (`with_naive_outbound`, `with_purego`).
+            All Linux builds are pure static (CGO disabled) and packed in `.tar.gz`.
           files: |
             dist/sing-box-*
             dist/SHA256SUMS

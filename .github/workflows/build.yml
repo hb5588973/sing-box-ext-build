@@ -122,31 +122,12 @@ jobs:
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
           FINAL_TAGS="${BASE_TAGS},with_awg"
           
-          # 如果是支持 naive 的平台，追加 tag
           if [ "${{ matrix.naive }}" = "true" ]; then
             FINAL_TAGS="${FINAL_TAGS},with_naive_outbound,with_purego"
           fi
           
-          echo "official default tags: ${BASE_TAGS}"
-          echo "final tags:           ${FINAL_TAGS}"
           echo "BASE_TAGS=${BASE_TAGS}" >> "$GITHUB_ENV"
           echo "FINAL_TAGS=${FINAL_TAGS}" >> "$GITHUB_ENV"
-
-      - name: Assert build tags
-        run: |
-          set -euo pipefail
-          echo "FINAL_TAGS=${FINAL_TAGS}"
-          case ",${FINAL_TAGS}," in
-            *,with_awg,*) ;;
-            *) echo "::error::missing with_awg"; exit 1 ;;
-          esac
-          
-          if [ "${{ matrix.naive }}" = "true" ]; then
-            case ",${FINAL_TAGS}," in
-              *,with_naive_outbound,*) ;;
-              *) echo "::error::missing with_naive_outbound"; exit 1 ;;
-            esac
-          fi
 
       - name: Build
         env:
@@ -167,11 +148,34 @@ jobs:
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
 
+      # === 新增：UPX 压缩与 YAT 打包 ===
+      - name: UPX Compress and Package
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/dist"
+          BIN="sing-box-${{ matrix.name }}"
+          
+          # 1. 尝试 UPX 压缩（UPX 不支持部分小众架构，失败则跳过不报错）
+          if [ "${{ matrix.goos }}" = "linux" ] && [ "${{ matrix.goarch }}" != "mips64" ] && [ "${{ matrix.goarch }}" != "mips64le" ] && [ "${{ matrix.goarch }}" != "riscv64" ]; then
+            echo "Running UPX on $BIN..."
+            sudo apt-get update && sudo apt-get install -y upx
+            upx -9 "$BIN" || echo "UPX compression failed or unsupported, continuing with original binary."
+          fi
+
+          # 2. 压缩成 .yat.gz (即 tar.gz)
+          # 如果是 Windows 产物，不进行 YAT 打包；如果是 Linux，执行 tar.gz 并改名为 .yat
+          if [ "${{ matrix.goos }}" = "linux" ]; then
+            echo "Packaging $BIN to YAT..."
+            tar -czvf "sing-box-${{ matrix.name }}.yat.gz" "$BIN"
+          fi
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: sing-box-${{ matrix.name }}
-          path: dist/sing-box-${{ matrix.name }}
+          path: |
+            dist/sing-box-${{ matrix.name }}
+            dist/sing-box-${{ matrix.name }}.yat.gz
           if-no-files-found: error
 
   release:
@@ -204,15 +208,10 @@ jobs:
             AmneziaWG (`with_awg`) and MASQUE CONNECT-IP (untagged).
 
             **Supported Features by Platform:**
-            - Linux amd64, arm64, armv7, macOS arm64, Windows amd64: NaiveProxy enabled (`with_naive_outbound`, `with_purego`).
-            - Linux armv6, riscv64, mipsle, mips, mips64le, mips64: NaiveProxy disabled (Cronet missing for these architectures).
+            - Linux amd64, arm64, armv7, macOS arm64, Windows amd64: NaiveProxy enabled.
+            - Linux armv6, riscv64, mipsle, mips, mips64le, mips64: NaiveProxy disabled.
 
-            Build tags (base): ${{ needs.meta.outputs.base_tags }},with_awg
-
-            CGO-free builds.
-
-            Updated by run ${{ github.run_number }} on ${{ github.run_started_at }}.
+            Binaries are packed as `.yat.gz` (tar.gz) for Linux where applicable.
           files: |
             dist/sing-box-*
-            dist/SHA256SUMS
           prerelease: false

@@ -48,18 +48,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # === Linux 主流架构 ===
-          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64,     naive: "true" }
-          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64,     naive: "true" }
-          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7,     naive: "true" }
-          # === Linux 小众/路由架构（无 Naive） ===
+          # === Linux 架构（纯静态，无 CGO，无 Naive） ===
+          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64,     naive: "false" }
+          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64,     naive: "false" }
+          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7,     naive: "false" }
           - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6,     naive: "false" }
           - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64,   naive: "false" }
           - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat, naive: "false" }
           - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat, naive: "false" }
           - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat, naive: "false" }
           - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat, naive: "false" }
-          # === 其它系统 ===
+          
+          # === Windows / macOS（保留 Naive 支持） ===
           - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64,    naive: "true" }
           - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe, naive: "true" }
     steps:
@@ -89,17 +89,12 @@ jobs:
           cache: true
           cache-dependency-path: src/go.sum
 
-      # 针对 Linux 原生 Naive 支持，安装 musl-gcc
-      - name: Install musl-tools
-        if: matrix.goos == 'linux' && matrix.naive == 'true'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools gcc
-
       - name: Compute build tags
         run: |
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
           FINAL_TAGS="${BASE_TAGS},with_awg"
           if [ "${{ matrix.naive }}" = "true" ]; then
-            FINAL_TAGS="${FINAL_TAGS},with_naive_outbound"
+            FINAL_TAGS="${FINAL_TAGS},with_naive_outbound,with_purego"
           fi
           echo "FINAL_TAGS=${FINAL_TAGS}" >> "$GITHUB_ENV"
 
@@ -110,22 +105,14 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           GOMIPS: ${{ matrix.gomips }}
           GOMIPS64: ${{ matrix.gomips64 }}
-          # 关键点：如果带 Naive 则开 CGO 用 musl-gcc，否则纯静态
-          CGO_ENABLED: ${{ matrix.naive == 'true' && matrix.goos == 'linux' && '1' || '0' }}
-          CC: ${{ matrix.naive == 'true' && matrix.goos == 'linux' && 'musl-gcc' || 'gcc' }}
+          CGO_ENABLED: "0"
         run: |
           mkdir -p dist
           cd src
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
-          # 强制外部链接和静态链接
-          EXTRA_LDFLAGS=""
-          if [ "${{ matrix.naive }}" = "true" ] && [ "${{ matrix.goos }}" = "linux" ]; then
-            EXTRA_LDFLAGS="-linkmode external -extldflags '-static'"
-          fi
-          
           go build -v -trimpath \
             -tags "${FINAL_TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w ${EXTRA_LDFLAGS}" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w" \
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
 
@@ -168,9 +155,12 @@ jobs:
           name: latest build
           make_latest: true
           body: |
-            **Linux:** Download `.tar.gz` archive, extract, then run.
-            **Windows:** Download `.exe`.
-            **Note:** Linux main builds are statically linked via musl. MIPS/RISC-V builds have Naive disabled due to missing cronet upstream support.
+            Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`).
+            
+            **Included:** AmneziaWG (`with_awg`), MASQUE CONNECT-IP (untagged).
+            **Platform Support:**
+            - **Linux:** Pure static (CGO disabled, no NaiveProxy). Download `.tar.gz`, extract, and run. Perfect for OpenWrt/ImmortalWrt.
+            - **Windows / macOS:** NaiveProxy enabled.
           files: |
             dist/sing-box-*
             dist/SHA256SUMS

@@ -37,8 +37,6 @@ jobs:
           set -euo pipefail
           SHA="$(git ls-remote "$UPSTREAM_REPO" "refs/heads/$UPSTREAM_BRANCH" | cut -f1)"
           BASE_TAGS="$(curl -fsSL "https://raw.githubusercontent.com/SagerNet/sing-box/$UPSTREAM_BRANCH/release/DEFAULT_BUILD_TAGS_OTHERS")"
-          test -n "$SHA"
-          test -n "$BASE_TAGS"
           echo "upstream_sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "base_tags=$BASE_TAGS" >> "$GITHUB_OUTPUT"
 
@@ -50,43 +48,36 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # === 主流架构：支持 NaiveProxy ===
+          # === Linux 主流架构 ===
           - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64,     naive: "true" }
           - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64,     naive: "true" }
           - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7,     naive: "true" }
-          - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64,    naive: "true" }
-          - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe, naive: "true" }
-          
-          # === 路由器/小众架构：剔除 NaiveProxy ===
+          # === Linux 小众/路由架构（无 Naive） ===
           - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6,     naive: "false" }
           - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64,   naive: "false" }
           - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat, naive: "false" }
           - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat, naive: "false" }
           - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat, naive: "false" }
           - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat, naive: "false" }
+          # === 其它系统 ===
+          - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64,    naive: "true" }
+          - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe, naive: "true" }
     steps:
       - name: Checkout patch repository
         uses: actions/checkout@v4
 
       - name: Clone upstream sing-box
         run: |
-          set -euo pipefail
           git clone --depth 1 --branch "$UPSTREAM_BRANCH" "$UPSTREAM_REPO" src
 
       - name: Clone AmneziaWG wireguard-go fork
         run: |
-          set -euo pipefail
-          git clone --depth 1 --branch "$WIREGUARD_BRANCH" \
-            "$WIREGUARD_REPO" \
-            "$WIREGUARD_PATH"
+          git clone --depth 1 --branch "$WIREGUARD_BRANCH" "$WIREGUARD_REPO" "$WIREGUARD_PATH"
 
       - name: Apply patches
         run: |
-          set -euo pipefail
           cd src
-          shopt -s nullglob
-          patches=("$GITHUB_WORKSPACE"/patches/*.patch)
-          for patch in "${patches[@]}"; do
+          for patch in "$GITHUB_WORKSPACE"/patches/*.patch; do
             git apply --check "$patch"
             git apply "$patch"
           done
@@ -98,13 +89,17 @@ jobs:
           cache: true
           cache-dependency-path: src/go.sum
 
+      # 针对 Linux 原生 Naive 支持，安装 musl-gcc
+      - name: Install musl-tools
+        if: matrix.goos == 'linux' && matrix.naive == 'true'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools gcc
+
       - name: Compute build tags
         run: |
-          set -euo pipefail
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
           FINAL_TAGS="${BASE_TAGS},with_awg"
           if [ "${{ matrix.naive }}" = "true" ]; then
-            FINAL_TAGS="${FINAL_TAGS},with_naive_outbound,with_purego"
+            FINAL_TAGS="${FINAL_TAGS},with_naive_outbound"
           fi
           echo "FINAL_TAGS=${FINAL_TAGS}" >> "$GITHUB_ENV"
 
@@ -115,26 +110,32 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           GOMIPS: ${{ matrix.gomips }}
           GOMIPS64: ${{ matrix.gomips64 }}
-          CGO_ENABLED: "0"
+          # 关键点：如果带 Naive 则开 CGO 用 musl-gcc，否则纯静态
+          CGO_ENABLED: ${{ matrix.naive == 'true' && matrix.goos == 'linux' && '1' || '0' }}
+          CC: ${{ matrix.naive == 'true' && matrix.goos == 'linux' && 'musl-gcc' || 'gcc' }}
         run: |
-          set -euo pipefail
           mkdir -p dist
           cd src
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
+          # 强制外部链接和静态链接
+          EXTRA_LDFLAGS=""
+          if [ "${{ matrix.naive }}" = "true" ] && [ "${{ matrix.goos }}" = "linux" ]; then
+            EXTRA_LDFLAGS="-linkmode external -extldflags '-static'"
+          fi
+          
           go build -v -trimpath \
             -tags "${FINAL_TAGS}" \
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w ${EXTRA_LDFLAGS}" \
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
 
       - name: Package Linux binaries
         run: |
-          set -euo pipefail
           cd "$GITHUB_WORKSPACE/dist"
           BIN="sing-box-${{ matrix.name }}"
           if [ "${{ matrix.goos }}" = "linux" ]; then
             tar -czvf "${BIN}.tar.gz" "$BIN"
-            rm "$BIN" # 删除原始 ELF 文件，只上传压缩包
+            rm "$BIN"
           fi
 
       - name: Upload artifact
@@ -167,9 +168,9 @@ jobs:
           name: latest build
           make_latest: true
           body: |
-            Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`) with AmneziaWG and MASQUE.
-            **Linux users:** Download `.tar.gz` archive, extract, then run.
-            **Windows users:** Download `.exe`.
+            **Linux:** Download `.tar.gz` archive, extract, then run.
+            **Windows:** Download `.exe`.
+            **Note:** Linux main builds are statically linked via musl. MIPS/RISC-V builds have Naive disabled due to missing cronet upstream support.
           files: |
             dist/sing-box-*
             dist/SHA256SUMS

@@ -72,6 +72,26 @@ cd ../..
 git add patches/
 git commit -m "fix: update patches for upstream changes"
 git push
+```
+
+## MASQUE auto-registration
+
+The `0003-masque-autoreg` patch makes `sing-box run` / `check` bootstrap a
+Cloudflare WARP MASQUE account without any `masque` entry in the config:
+
+1. if `<exe_dir>/warp-masque-account.json` is missing, a WARP device is registered;
+2. the derived outbounds are written to `<exe_dir>/proxies/warp-wg.json`
+   (tags `warp-masque-1`, `warp-masque-2`);
+3. on the first config read, they are merged into the in-memory config before it is
+   decoded — the config file itself is never modified.
+
+A config that already declares a `type: "masque"` outbound is left untouched, and a
+failed registration is logged while sing-box starts with the original config. Route
+to the injected nodes by tag:
+
+```json
+{"route": {"rules": [{"outbound": "warp-masque-1", "network": ["tcp", "udp"]}]}}
+```
 
 ## Layout
 
@@ -79,5 +99,6 @@ git push
 patches/
   0001-amneziawg.patch        option + transport/wireguard AWG support, go.mod replace
   0002-masque-outbound.patch  MASQUE outbound, connectip package, registration
+  0003-masque-autoreg.patch   WARP auto-registration + in-memory outbound injection
 .github/workflows/build.yml
 ```

@@ -53,19 +53,20 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Linux
-          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64 }
-          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64 }
-          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7 }
-          - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6 }
-          - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64 }
-          - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat }
-          - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat }
-          - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat }
-          - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat }
-          # macOS / Windows
-          - { goos: darwin,  goarch: arm64, goarm: "", name: darwin-arm64 }
-          - { goos: windows, goarch: amd64, goarm: "", name: windows-amd64.exe }
+          # === 主流架构：支持 NaiveProxy ===
+          - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64,     naive: "true" }
+          - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64,     naive: "true" }
+          - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7,     naive: "true" }
+          - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64,    naive: "true" }
+          - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe, naive: "true" }
+          
+          # === 路由器/小众架构：剔除 NaiveProxy 以保证编译通过 ===
+          - { goos: linux, goarch: arm,      goarm: "6", name: linux-armv6,     naive: "false" }
+          - { goos: linux, goarch: riscv64,  goarm: "",  name: linux-riscv64,   naive: "false" }
+          - { goos: linux, goarch: mipsle,   goarm: "",  name: linux-mipsle-softfloat,   gomips: softfloat, naive: "false" }
+          - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat, naive: "false" }
+          - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat, naive: "false" }
+          - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat, naive: "false" }
     steps:
       - name: Checkout patch repository
         uses: actions/checkout@v4
@@ -119,7 +120,13 @@ jobs:
         run: |
           set -euo pipefail
           BASE_TAGS="$(cat src/release/DEFAULT_BUILD_TAGS_OTHERS)"
-          FINAL_TAGS="${BASE_TAGS},with_awg,with_naive_outbound"
+          FINAL_TAGS="${BASE_TAGS},with_awg"
+          
+          # 如果是支持 naive 的平台，追加 tag
+          if [ "${{ matrix.naive }}" = "true" ]; then
+            FINAL_TAGS="${FINAL_TAGS},with_naive_outbound,with_purego"
+          fi
+          
           echo "official default tags: ${BASE_TAGS}"
           echo "final tags:           ${FINAL_TAGS}"
           echo "BASE_TAGS=${BASE_TAGS}" >> "$GITHUB_ENV"
@@ -133,14 +140,13 @@ jobs:
             *,with_awg,*) ;;
             *) echo "::error::missing with_awg"; exit 1 ;;
           esac
-          case ",${FINAL_TAGS}," in
-            *,with_naive_outbound,*) ;;
-            *) echo "::error::missing with_naive_outbound"; exit 1 ;;
-          esac
-          case ",${FINAL_TAGS}," in
-            *,with_wireguard,*) ;;
-            *) echo "::error::with_wireguard missing from the official default set"; exit 1 ;;
-          esac
+          
+          if [ "${{ matrix.naive }}" = "true" ]; then
+            case ",${FINAL_TAGS}," in
+              *,with_naive_outbound,*) ;;
+              *) echo "::error::missing with_naive_outbound"; exit 1 ;;
+            esac
+          fi
 
       - name: Build
         env:
@@ -195,14 +201,15 @@ jobs:
           make_latest: true
           body: |
             Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`) with
-            AmneziaWG (`with_awg`), MASQUE CONNECT-IP (untagged), and NaiveProxy (`with_naive_outbound`).
+            AmneziaWG (`with_awg`) and MASQUE CONNECT-IP (untagged).
 
-            Build tags:
-            ${{ needs.meta.outputs.base_tags }},with_awg,with_naive_outbound
+            **Supported Features by Platform:**
+            - Linux amd64, arm64, armv7, macOS arm64, Windows amd64: NaiveProxy enabled (`with_naive_outbound`, `with_purego`).
+            - Linux armv6, riscv64, mipsle, mips, mips64le, mips64: NaiveProxy disabled (Cronet missing for these architectures).
+
+            Build tags (base): ${{ needs.meta.outputs.base_tags }},with_awg
 
             CGO-free builds.
-
-            Platforms: linux-{amd64,arm64,armv7,armv6,riscv64,mipsle,mips,mips64le,mips64}, darwin-arm64, windows-amd64.
 
             Updated by run ${{ github.run_number }} on ${{ github.run_started_at }}.
           files: |

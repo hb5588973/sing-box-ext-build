@@ -18,7 +18,9 @@ Builds [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaW
    the run with `::error::`;
 4. computes the build tags **from upstream**:
    `src/release/DEFAULT_BUILD_TAGS_OTHERS` + `,with_awg`;
-5. builds `linux/amd64`, `darwin/arm64`, `windows/amd64` with `CGO_ENABLED=0`;
+5. builds `linux/amd64`, `darwin/arm64`, `windows/amd64` with `CGO_ENABLED=0`,
+   using upstream's own `release/LDFLAGS` (which includes `-checklinkname=0`,
+   required by the `badlinkname` / `tfogo_checklinkname0` tags);
 6. updates the rolling `latest` release with the three binaries.
 
 ## Download

@@ -140,9 +140,12 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           cd src
+          # Official linker flags: the `badlinkname`/`tfogo_checklinkname0`
+          # tags only link with -checklinkname=0 (release/LDFLAGS).
+          LDFLAGS_SHARED="$(cat release/LDFLAGS)"
           go build -v -trimpath \
             -tags "${FINAL_TAGS}" \
-            -ldflags "-s -w -X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}'" \
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w" \
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
 

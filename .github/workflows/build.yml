@@ -48,7 +48,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # === 全部的 Linux 架构（纯净静态编译） ===
+          # === Linux 架构（纯净静态，无 Naive） ===
           - { goos: linux, goarch: amd64,    goarm: "",  name: linux-amd64 }
           - { goos: linux, goarch: arm64,    goarm: "",  name: linux-arm64 }
           - { goos: linux, goarch: arm,      goarm: "7", name: linux-armv7 }
@@ -102,7 +102,7 @@ jobs:
           GOARM: ${{ matrix.goarm }}
           GOMIPS: ${{ matrix.gomips }}
           GOMIPS64: ${{ matrix.gomips64 }}
-          CGO_ENABLED: "0"
+          CGO_ENABLED: "0" # 强制纯静态编译
         run: |
           mkdir -p dist
           cd src
@@ -113,7 +113,7 @@ jobs:
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box
           
-          # 验证是否为静态链接
+          # 强制校验：必须静态链接，否则报错阻断
           if [ "${{ matrix.goos }}" = "linux" ]; then
             FILE_INFO=$(file "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}")
             echo "File info: $FILE_INFO"
@@ -128,8 +128,8 @@ jobs:
           cd "$GITHUB_WORKSPACE/dist"
           BIN="sing-box-${{ matrix.name }}"
           if [ "${{ matrix.goos }}" = "linux" ]; then
-            # 加上 run_number 强制防代理缓存
-            tar -czvf "${BIN}-r${{ github.run_number }}.tar.gz" "$BIN"
+            # 注意这里！名字回归纯净的 .tar.gz，配合你的更新脚本
+            tar -czvf "${BIN}.tar.gz" "$BIN"
             rm "$BIN"
           fi
 
@@ -164,9 +164,7 @@ jobs:
           make_latest: true
           body: |
             Automated build of SagerNet/sing-box `${{ needs.meta.outputs.upstream_sha }}` (`testing`).
-            
             **Includes:** AmneziaWG (`with_awg`), MASQUE CONNECT-IP.
-            
             Linux binaries are pure static (CGO disabled) and packed in `.tar.gz`.
           files: |
             dist/sing-box-*

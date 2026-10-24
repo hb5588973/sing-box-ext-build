@@ -1,0 +1,2158 @@
+diff --git a/constant/proxy.go b/constant/proxy.go
+index 2993eb91b..b68af07f5 100644
+--- a/constant/proxy.go
++++ b/constant/proxy.go
+@@ -29,6 +29,7 @@ const (
+ 	TypeOpenConnect        = "openconnect"
+ 	TypeOpenVPNClient      = "openvpn-client"
+ 	TypeOpenVPNServer      = "openvpn-server"
++	TypeMASQUE             = "masque"
+ 	TypeMASQUEClient       = "masque-client"
+ 	TypeMASQUEServer       = "masque-server"
+ 	TypeTailscale          = "tailscale"
+@@ -111,6 +112,8 @@ func ProxyDisplayName(proxyType string) string {
+ 		return "OpenVPN Client"
+ 	case TypeOpenVPNServer:
+ 		return "OpenVPN Server"
++	case TypeMASQUE:
++		return "MASQUE"
+ 	case TypeMASQUEClient:
+ 		return "MASQUE Client"
+ 	case TypeMASQUEServer:
+diff --git a/include/registry.go b/include/registry.go
+index fbb398d11..85fa6cb44 100644
+--- a/include/registry.go
++++ b/include/registry.go
+@@ -103,6 +103,7 @@ func OutboundRegistry() *outbound.Registry {
+ 	vless.RegisterOutbound(registry)
+ 	anytls.RegisterOutbound(registry)
+ 
++	masque.RegisterOutbound(registry)
+ 	registerQUICOutbounds(registry)
+ 	registerTailcatOutbound(registry)
+ 	registerStubForRemovedOutbounds(registry)
+diff --git a/option/masque_outbound.go b/option/masque_outbound.go
+new file mode 100644
+index 000000000..b287104c4
+--- /dev/null
++++ b/option/masque_outbound.go
+@@ -0,0 +1,15 @@
++package option
++
++type MASQUEOutboundOptions struct {
++	ServerOptions
++	Profile    string              `json:"profile,omitempty"`
++	PrivateKey string              `json:"private_key,omitempty"`
++	PublicKey  string              `json:"public_key,omitempty"`
++	IP         string              `json:"ip,omitempty"`
++	IPv6       string              `json:"ipv6,omitempty"`
++	URI        string              `json:"uri,omitempty"`
++	TLS        *OutboundTLSOptions `json:"tls,omitempty"`
++	MTU        uint32              `json:"mtu,omitempty"`
++	DialerOptions
++	NetworkList NetworkList `json:"network,omitempty"`
++}
+\ No newline at end of file
+diff --git a/protocol/masque/outbound.go b/protocol/masque/outbound.go
+new file mode 100644
+index 000000000..7162cdee8
+--- /dev/null
++++ b/protocol/masque/outbound.go
+@@ -0,0 +1,445 @@
++package masque
++
++import (
++	"context"
++	"crypto/ecdsa"
++	stdtls "crypto/tls"
++	"crypto/x509"
++	"encoding/base64"
++	"io"
++	"net"
++	"net/netip"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/sagernet/quic-go"
++	"github.com/sagernet/sing-box/adapter"
++	"github.com/sagernet/sing-box/adapter/outbound"
++	"github.com/sagernet/sing-box/common/dialer"
++	C "github.com/sagernet/sing-box/constant"
++	"github.com/sagernet/sing-box/log"
++	"github.com/sagernet/sing-box/option"
++	"github.com/sagernet/sing-box/transport/device"
++	"github.com/sagernet/sing-box/transport/masque"
++	"github.com/sagernet/sing/common/buf"
++	"github.com/sagernet/sing/common/bufio"
++	E "github.com/sagernet/sing/common/exceptions"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++	"github.com/sagernet/sing/service"
++)
++
++func RegisterOutbound(registry *outbound.Registry) {
++	outbound.Register[option.MASQUEOutboundOptions](registry, C.TypeMASQUE, NewOutbound)
++}
++
++const defaultMTU uint32 = 1280
++
++type Outbound struct {
++	outbound.Adapter
++	ctx       context.Context
++	logger    log.ContextLogger
++	dialer    N.Dialer
++	dnsRouter adapter.DNSRouter
++	profile   masque.Profile
++
++	server     M.Socksaddr
++	uri        string
++	mtu        uint32
++	prefixes   []netip.Prefix
++	tlsConfig  *stdtls.Config
++	quicConfig *quic.Config
++
++	runMu  sync.Mutex
++	sess   *session
++	closed bool
++}
++
++type session struct {
++	device   device.Device
++	closer   io.Closer
++	ipConn   masque.IpConn
++	ctx      context.Context
++	cancel   context.CancelFunc
++	teardown sync.Once
++}
++
++func NewOutbound(ctx context.Context, router adapter.Router, logger log.ContextLogger, tag string, options option.MASQUEOutboundOptions) (adapter.Outbound, error) {
++	profile, err := masque.ParseProfile(options.Profile)
++	if err != nil {
++		return nil, err
++	}
++
++	uri := options.URI
++	if uri == "" {
++		uri = profile.DefaultURI
++	}
++	if uri == "" {
++		return nil, E.New("masque: uri is required for the standard profile")
++	}
++
++	prefixes, err := parsePrefixes(options.IP, options.IPv6)
++	if err != nil {
++		return nil, err
++	}
++
++	var privKey *ecdsa.PrivateKey
++	var pubKey *ecdsa.PublicKey
++	if options.PrivateKey != "" {
++		privKey, err = parseECPrivateKey(options.PrivateKey)
++		if err != nil {
++			return nil, E.Cause(err, "parse private_key")
++		}
++	}
++	if options.PublicKey != "" {
++		pubKey, err = parseECPublicKey(options.PublicKey)
++		if err != nil {
++			return nil, E.Cause(err, "parse public_key")
++		}
++	}
++	if profile.PinPublicKey && (privKey == nil || pubKey == nil) {
++		return nil, E.New("masque: private_key and public_key are required for the cloudflare profile")
++	}
++
++	sni := ""
++	if options.TLS != nil {
++		sni = options.TLS.ServerName
++	}
++	if sni == "" {
++		sni = profile.DefaultSNI
++	}
++	if sni == "" {
++		sni = options.Server
++	}
++
++	insecure := options.TLS != nil && options.TLS.Insecure
++	tlsConfig, err := masque.PrepareTLSConfig(profile, privKey, pubKey, sni, insecure)
++	if err != nil {
++		return nil, err
++	}
++
++	mtu := options.MTU
++	if mtu == 0 {
++		mtu = defaultMTU
++	}
++
++	outboundDialer, err := dialer.New(ctx, options.DialerOptions, options.ServerIsDomain())
++	if err != nil {
++		return nil, err
++	}
++
++	quicConfig := &quic.Config{
++		EnableDatagrams: true,
++		KeepAlivePeriod: 30 * time.Second,
++	}
++
++	networkList := options.NetworkList.Build()
++
++	return &Outbound{
++		Adapter:    outbound.NewAdapterWithDialerOptions(C.TypeMASQUE, tag, networkList, options.DialerOptions),
++		ctx:        ctx,
++		logger:     logger,
++		dialer:     outboundDialer,
++		dnsRouter:  service.FromContext[adapter.DNSRouter](ctx),
++		profile:    profile,
++		server:     options.ServerOptions.Build(),
++		uri:        uri,
++		mtu:        mtu,
++		prefixes:   prefixes,
++		tlsConfig:  tlsConfig,
++		quicConfig: quicConfig,
++	}, nil
++}
++
++func (o *Outbound) ensureSession(ctx context.Context) (*session, error) {
++	o.runMu.Lock()
++	defer o.runMu.Unlock()
++	if o.closed {
++		return nil, E.New("masque: outbound closed")
++	}
++	if o.sess != nil {
++		return o.sess, nil
++	}
++
++	// The userspace stack is built with transport/device, not
++	// transport/wireguard.NewDevice. Upstream's wireguard.Device is a
++	// WireGuard TUN: it routes stack-emitted packets to peers by their
++	// AllowedIPs and its Read is never used by the tunnel pump. With no
++	// WireGuard peer to route to, every packet becomes "unrouted", the stack
++	// receives a synthesized ICMP host-unreachable and DialContext fails with
++	// "go: connect: no route to host". transport/device is the upstream-native
++	// stack for tunnel outbounds (MASQUE, OpenVPN, OpenConnect) and exposes the
++	// two directions we actually need: SetPacketWriter (stack -> tunnel) and
++	// WriteInboundBuffers (tunnel -> stack).
++	o.logger.DebugContext(ctx, "masque: establishing h3 tunnel to ", o.server, " (sni=", o.tlsConfig.ServerName, ")")
++	closer, ipConn, err := o.connectH3(ctx)
++	if err != nil {
++		o.logger.WarnContext(ctx, "masque: h3 tunnel to ", o.server, " failed: ", err)
++		return nil, err
++	}
++	o.logger.InfoContext(ctx, "masque: h3 tunnel established to ", o.server)
++
++	tunnelDevice, err := device.New(device.Options{
++		Context: o.ctx,
++		Logger:  o.logger,
++		Name:    "masque",
++		MTU:     o.mtu,
++		Configuration: device.Configuration{
++			MTU:     o.mtu,
++			Address: o.prefixes,
++		},
++	})
++	if err != nil {
++		_ = ipConn.Close()
++		_ = closer.Close()
++		return nil, E.Cause(err, "create userspace stack")
++	}
++	tunnelDevice.SetPacketWriter(func(packetBuffers []*buf.Buffer) error {
++		return writeToTunnel(tunnelDevice, ipConn, packetBuffers)
++	})
++	if err = tunnelDevice.Start(); err != nil {
++		_ = tunnelDevice.Close()
++		_ = ipConn.Close()
++		_ = closer.Close()
++		return nil, E.Cause(err, "start userspace stack")
++	}
++
++	sessCtx, cancel := context.WithCancel(o.ctx)
++	s := &session{
++		device: tunnelDevice,
++		closer: closer,
++		ipConn: ipConn,
++		ctx:    sessCtx,
++		cancel: cancel,
++	}
++	o.sess = s
++
++	go o.pumpFromTunnel(s)
++
++	return s, nil
++}
++
++func (o *Outbound) teardownSession(s *session) {
++	s.teardown.Do(func() {
++		s.cancel()
++		if s.ipConn != nil {
++			_ = s.ipConn.Close()
++		}
++		if s.closer != nil {
++			_ = s.closer.Close()
++		}
++		if s.device != nil {
++			_ = s.device.Close()
++		}
++		o.runMu.Lock()
++		if o.sess == s {
++			o.sess = nil
++		}
++		o.runMu.Unlock()
++	})
++}
++
++func (o *Outbound) connectH3(ctx context.Context) (io.Closer, masque.IpConn, error) {
++	udpConn, err := o.dialer.DialContext(ctx, N.NetworkUDP, o.server)
++	if err != nil {
++		return nil, nil, E.Cause(err, "dial udp")
++	}
++	o.logger.DebugContext(ctx, "masque: udp socket to ", o.server, " up, starting QUIC handshake")
++	quicConn, err := quic.DialEarly(ctx, bufio.NewUnbindPacketConn(udpConn), udpConn.RemoteAddr(), o.tlsConfig, o.quicConfig)
++	if err != nil {
++		_ = udpConn.Close()
++		return nil, nil, E.Cause(err, "dial quic")
++	}
++	tr, ipConn, err := masque.ConnectTunnelH3(ctx, o.profile, quicConn, o.uri)
++	if err != nil {
++		_ = udpConn.Close()
++		return nil, nil, err
++	}
++	return &h3Closer{transport: tr, rawConn: udpConn}, ipConn, nil
++}
++
++// writeToTunnel is the stack -> tunnel half of the pump. transport/device
++// invokes it from its own outbound queue goroutine with buffers it owns, so it
++// releases them here; replies handed back by the transport (ICMP "packet too
++// big") go straight back into the stack so it can lower its path MTU.
++func writeToTunnel(tunnelDevice device.Device, ipConn masque.IpConn, packetBuffers []*buf.Buffer) error {
++	defer buf.ReleaseMulti(packetBuffers)
++	var replies []*buf.Buffer
++	for _, packetBuffer := range packetBuffers {
++		icmpReply, err := ipConn.WritePacket(packetBuffer.Bytes())
++		if err != nil {
++			buf.ReleaseMulti(replies)
++			return err
++		}
++		if len(icmpReply) > 0 {
++			replies = append(replies, buf.As(icmpReply))
++		}
++	}
++	if len(replies) > 0 {
++		_ = tunnelDevice.WriteInboundBuffers(replies)
++	}
++	return nil
++}
++
++func (o *Outbound) pumpFromTunnel(s *session) {
++	defer o.teardownSession(s)
++	for s.ctx.Err() == nil {
++		packet, err := s.ipConn.ReadPacket()
++		if err != nil {
++			o.pumpFatal(s, "read from tunnel", err)
++			return
++		}
++		if err = s.device.WriteInboundBuffers([]*buf.Buffer{buf.As(packet)}); err != nil {
++			o.pumpFatal(s, "write to stack", err)
++			return
++		}
++	}
++}
++
++func (o *Outbound) pumpFatal(s *session, op string, err error) {
++	if s.ctx.Err() != nil {
++		return
++	}
++	o.logger.Warn("masque: tunnel died: ", op, ": ", err)
++}
++
++func (o *Outbound) DialContext(ctx context.Context, network string, destination M.Socksaddr) (net.Conn, error) {
++	s, err := o.ensureSession(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if destination.IsDomain() {
++		addresses, err := o.lookup(ctx, destination.Fqdn)
++		if err != nil {
++			return nil, err
++		}
++		return N.DialSerial(ctx, s.device, network, destination, addresses)
++	}
++	if !destination.Addr.IsValid() {
++		return nil, E.New("invalid destination: ", destination)
++	}
++	return s.device.DialContext(ctx, network, destination)
++}
++
++func (o *Outbound) ListenPacket(ctx context.Context, destination M.Socksaddr) (net.PacketConn, error) {
++	s, err := o.ensureSession(ctx)
++	if err != nil {
++		return nil, err
++	}
++	if destination.IsDomain() {
++		addresses, err := o.lookup(ctx, destination.Fqdn)
++		if err != nil {
++			return nil, err
++		}
++		packetConn, destinationAddress, err := N.ListenSerial(ctx, s.device, destination, addresses)
++		if err != nil {
++			return nil, err
++		}
++		if destinationAddress.IsValid() && destination != M.SocksaddrFrom(destinationAddress, destination.Port) {
++			return bufio.NewNATPacketConn(bufio.NewPacketConn(packetConn), M.SocksaddrFrom(destinationAddress, destination.Port), destination), nil
++		}
++		return packetConn, nil
++	}
++	if !destination.Addr.IsValid() {
++		return nil, E.New("invalid destination: ", destination)
++	}
++	return s.device.ListenPacket(ctx, destination)
++}
++
++func (o *Outbound) lookup(ctx context.Context, domain string) ([]netip.Addr, error) {
++	if o.dnsRouter == nil {
++		return nil, E.New("masque: no DNS router available to resolve ", domain)
++	}
++	return o.dnsRouter.Lookup(ctx, domain, adapter.DNSQueryOptions{})
++}
++
++func (o *Outbound) Start(stage adapter.StartStage, scope *adapter.Scope) error {
++	if stage == adapter.StartStateInitialize {
++		scope.Add(o.Close)
++	}
++	return nil
++}
++
++func (o *Outbound) Close() error {
++	o.runMu.Lock()
++	if o.closed {
++		o.runMu.Unlock()
++		return nil
++	}
++	o.closed = true
++	s := o.sess
++	o.sess = nil
++	o.runMu.Unlock()
++	if s != nil {
++		o.teardownSession(s)
++	}
++	return nil
++}
++
++type h3Closer struct {
++	transport io.Closer
++	rawConn   net.Conn
++}
++
++func (c *h3Closer) Close() error {
++	if c.transport != nil {
++		_ = c.transport.Close()
++	}
++	if c.rawConn != nil {
++		_ = c.rawConn.Close()
++	}
++	return nil
++}
++
++func parsePrefixes(ip, ipv6 string) ([]netip.Prefix, error) {
++	prefixes := make([]netip.Prefix, 0, 2)
++	if ip != "" {
++		if !strings.Contains(ip, "/") {
++			ip += "/32"
++		}
++		prefix, err := netip.ParsePrefix(ip)
++		if err != nil {
++			return nil, E.Cause(err, "parse ip")
++		}
++		prefixes = append(prefixes, prefix)
++	}
++	if ipv6 != "" {
++		if !strings.Contains(ipv6, "/") {
++			ipv6 += "/128"
++		}
++		prefix, err := netip.ParsePrefix(ipv6)
++		if err != nil {
++			return nil, E.Cause(err, "parse ipv6")
++		}
++		prefixes = append(prefixes, prefix)
++	}
++	if len(prefixes) == 0 {
++		return nil, E.New("masque: at least one of ip/ipv6 is required")
++	}
++	return prefixes, nil
++}
++
++func parseECPrivateKey(b64 string) (*ecdsa.PrivateKey, error) {
++	der, err := base64.StdEncoding.DecodeString(b64)
++	if err != nil {
++		return nil, err
++	}
++	return x509.ParseECPrivateKey(der)
++}
++
++func parseECPublicKey(b64 string) (*ecdsa.PublicKey, error) {
++	der, err := base64.StdEncoding.DecodeString(b64)
++	if err != nil {
++		return nil, err
++	}
++	pub, err := x509.ParsePKIXPublicKey(der)
++	if err != nil {
++		return nil, err
++	}
++	ecPub, ok := pub.(*ecdsa.PublicKey)
++	if !ok {
++		return nil, E.New("public_key is not an ECDSA key")
++	}
++	return ecPub, nil
++}
+diff --git a/transport/masque/connectip/capsule.go b/transport/masque/connectip/capsule.go
+new file mode 100644
+index 000000000..3c23e9f2b
+--- /dev/null
++++ b/transport/masque/connectip/capsule.go
+@@ -0,0 +1,182 @@
++package connectip
++
++// Vendored from connect-ip-go (MIT). Address/route capsules of RFC 9484,
++// ported onto sagernet/quic-go. See connectip.go header for provenance.
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"net/netip"
++
++	"github.com/sagernet/quic-go/http3"
++	"github.com/sagernet/quic-go/quicvarint"
++)
++
++const (
++	capsuleTypeAddressAssign      http3.CapsuleType = 1
++	capsuleTypeAddressRequest     http3.CapsuleType = 2
++	capsuleTypeRouteAdvertisement http3.CapsuleType = 3
++)
++
++type addressAssignCapsule struct {
++	AssignedAddresses []AssignedAddress
++}
++
++// AssignedAddress represents an Assigned Address within an ADDRESS_ASSIGN capsule.
++type AssignedAddress struct {
++	RequestID uint64
++	IPPrefix  netip.Prefix
++}
++
++func parseAddressAssignCapsule(r io.Reader) (*addressAssignCapsule, error) {
++	var assignedAddresses []AssignedAddress
++	for {
++		requestID, prefix, err := parseAddress(r)
++		if err != nil {
++			if err == io.EOF {
++				break
++			}
++			return nil, err
++		}
++		assignedAddresses = append(assignedAddresses, AssignedAddress{RequestID: requestID, IPPrefix: prefix})
++	}
++	return &addressAssignCapsule{AssignedAddresses: assignedAddresses}, nil
++}
++
++func parseAddress(r io.Reader) (requestID uint64, prefix netip.Prefix, _ error) {
++	vr := quicvarint.NewReader(r)
++	requestID, err := quicvarint.Read(vr)
++	if err != nil {
++		return 0, netip.Prefix{}, err
++	}
++	ipVer, err := vr.ReadByte()
++	if err != nil {
++		return 0, netip.Prefix{}, err
++	}
++	var ip netip.Addr
++	switch ipVer {
++	case 4:
++		var v4 [4]byte
++		if _, err := io.ReadFull(r, v4[:]); err != nil {
++			return 0, netip.Prefix{}, err
++		}
++		ip = netip.AddrFrom4(v4)
++	case 6:
++		var v6 [16]byte
++		if _, err := io.ReadFull(r, v6[:]); err != nil {
++			return 0, netip.Prefix{}, err
++		}
++		ip = netip.AddrFrom16(v6)
++	default:
++		return 0, netip.Prefix{}, fmt.Errorf("invalid IP version: %d", ipVer)
++	}
++	prefixLen, err := vr.ReadByte()
++	if err != nil {
++		return 0, netip.Prefix{}, err
++	}
++	if int(prefixLen) > ip.BitLen() {
++		return 0, netip.Prefix{}, fmt.Errorf("prefix length %d exceeds IP address length (%d)", prefixLen, ip.BitLen())
++	}
++	prefix = netip.PrefixFrom(ip, int(prefixLen))
++	if prefix != prefix.Masked() {
++		return 0, netip.Prefix{}, errors.New("lower bits not covered by prefix length are not all zero")
++	}
++	return requestID, prefix, nil
++}
++
++type routeAdvertisementCapsule struct {
++	IPAddressRanges []IPRoute
++}
++
++// IPRoute represents an IP Address Range advertised in a ROUTE_ADVERTISEMENT capsule.
++type IPRoute struct {
++	StartIP netip.Addr
++	EndIP   netip.Addr
++	// IPProtocol is the Internet Protocol Number for traffic that can be sent to
++	// this range. If 0, all protocols are allowed.
++	IPProtocol uint8
++}
++
++func (r IPRoute) len() int { return 1 + r.StartIP.BitLen()/8 + r.EndIP.BitLen()/8 + 1 }
++
++func parseRouteAdvertisementCapsule(r io.Reader) (*routeAdvertisementCapsule, error) {
++	var ranges []IPRoute
++	for {
++		ipRange, err := parseIPAddressRange(r)
++		if err != nil {
++			if err == io.EOF {
++				break
++			}
++			return nil, err
++		}
++		ranges = append(ranges, ipRange)
++	}
++	return &routeAdvertisementCapsule{IPAddressRanges: ranges}, nil
++}
++
++func (c *routeAdvertisementCapsule) append(b []byte) []byte {
++	var totalLen int
++	for _, ipRange := range c.IPAddressRanges {
++		totalLen += ipRange.len()
++	}
++
++	b = quicvarint.Append(b, uint64(capsuleTypeRouteAdvertisement))
++	b = quicvarint.Append(b, uint64(totalLen))
++
++	for _, ipRange := range c.IPAddressRanges {
++		if ipRange.StartIP.Is4() {
++			b = append(b, 4)
++		} else {
++			b = append(b, 6)
++		}
++		b = append(b, ipRange.StartIP.AsSlice()...)
++		b = append(b, ipRange.EndIP.AsSlice()...)
++		b = append(b, ipRange.IPProtocol)
++	}
++	return b
++}
++
++func parseIPAddressRange(r io.Reader) (IPRoute, error) {
++	var ipVer uint8
++	if err := binary.Read(r, binary.LittleEndian, &ipVer); err != nil {
++		return IPRoute{}, err
++	}
++
++	var startIP, endIP netip.Addr
++	switch ipVer {
++	case 4:
++		var start, end [4]byte
++		if _, err := io.ReadFull(r, start[:]); err != nil {
++			return IPRoute{}, err
++		}
++		if _, err := io.ReadFull(r, end[:]); err != nil {
++			return IPRoute{}, err
++		}
++		startIP = netip.AddrFrom4(start)
++		endIP = netip.AddrFrom4(end)
++	case 6:
++		var start, end [16]byte
++		if _, err := io.ReadFull(r, start[:]); err != nil {
++			return IPRoute{}, err
++		}
++		if _, err := io.ReadFull(r, end[:]); err != nil {
++			return IPRoute{}, err
++		}
++		startIP = netip.AddrFrom16(start)
++		endIP = netip.AddrFrom16(end)
++	default:
++		return IPRoute{}, fmt.Errorf("invalid IP version: %d", ipVer)
++	}
++
++	if startIP.Compare(endIP) > 0 {
++		return IPRoute{}, errors.New("start IP is greater than end IP")
++	}
++
++	var ipProtocol uint8
++	if err := binary.Read(r, binary.LittleEndian, &ipProtocol); err != nil {
++		return IPRoute{}, err
++	}
++	return IPRoute{StartIP: startIP, EndIP: endIP, IPProtocol: ipProtocol}, nil
++}
+diff --git a/transport/masque/connectip/capsule_test.go b/transport/masque/connectip/capsule_test.go
+new file mode 100644
+index 000000000..a56732dc8
+--- /dev/null
++++ b/transport/masque/connectip/capsule_test.go
+@@ -0,0 +1,75 @@
++package connectip
++
++import (
++	"bytes"
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/quic-go/http3"
++	"github.com/sagernet/quic-go/quicvarint"
++)
++
++func TestRouteAdvertisementRoundTrip(t *testing.T) {
++	t.Parallel()
++	orig := &routeAdvertisementCapsule{IPAddressRanges: []IPRoute{
++		{
++			StartIP:    netip.AddrFrom4([4]byte{}),
++			EndIP:      netip.AddrFrom4([4]byte{255, 255, 255, 255}),
++			IPProtocol: 0,
++		},
++	}}
++
++	encoded := orig.append(nil)
++
++	// lx: quic-go v0.61 replaced ParseCapsule with the stateful CapsuleParser.
++	typ, body, err := http3.NewCapsuleParser(bytes.NewReader(encoded)).Next()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if typ != capsuleTypeRouteAdvertisement {
++		t.Fatalf("wrong capsule type: %d", typ)
++	}
++	parsed, err := parseRouteAdvertisementCapsule(body)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(parsed.IPAddressRanges) != 1 {
++		t.Fatalf("expected 1 range, got %d", len(parsed.IPAddressRanges))
++	}
++	got := parsed.IPAddressRanges[0]
++	if got.StartIP != orig.IPAddressRanges[0].StartIP || got.EndIP != orig.IPAddressRanges[0].EndIP {
++		t.Fatalf("range mismatch: %+v", got)
++	}
++}
++
++func TestAddressAssignParse(t *testing.T) {
++	t.Parallel()
++	// ADDRESS_ASSIGN payload: one IPv4 /32 (request id 0) and one IPv6 /128
++	// (request id 1), encoded as RFC 9484 §5.1 specifies.
++	var payload []byte
++	payload = quicvarint.Append(payload, 0)
++	payload = append(payload, 4)
++	payload = append(payload, netip.MustParseAddr("172.16.0.2").AsSlice()...)
++	payload = append(payload, 32)
++	payload = quicvarint.Append(payload, 1)
++	payload = append(payload, 6)
++	payload = append(payload, netip.MustParseAddr("2606:4700::").AsSlice()...)
++	payload = append(payload, 128)
++
++	parsed, err := parseAddressAssignCapsule(bytes.NewReader(payload))
++	if err != nil {
++		t.Fatal(err)
++	}
++	if len(parsed.AssignedAddresses) != 2 {
++		t.Fatalf("expected 2 addresses, got %d", len(parsed.AssignedAddresses))
++	}
++	if got := parsed.AssignedAddresses[0].IPPrefix; got != netip.MustParsePrefix("172.16.0.2/32") {
++		t.Fatalf("v4 prefix mismatch: %v", got)
++	}
++	if got := parsed.AssignedAddresses[1].IPPrefix; got != netip.MustParsePrefix("2606:4700::/128") {
++		t.Fatalf("v6 prefix mismatch: %v", got)
++	}
++	if parsed.AssignedAddresses[1].RequestID != 1 {
++		t.Fatalf("request id mismatch: %d", parsed.AssignedAddresses[1].RequestID)
++	}
++}
+diff --git a/transport/masque/connectip/connectip.go b/transport/masque/connectip/connectip.go
+new file mode 100644
+index 000000000..9aafbba7d
+--- /dev/null
++++ b/transport/masque/connectip/connectip.go
+@@ -0,0 +1,435 @@
++// Package connectip is a vendored, lx-adapted subset of connect-ip-go
++// (CONNECT-IP / RFC 9484 client side), ported onto the sagernet/quic-go fork.
++//
++// Upstream: https://github.com/metacubex/connect-ip-go (which in turn forked
++// github.com/quic-go/connect-ip-go). We vendor it here (SPEC 021) instead of
++// adding an external dependency, because the upstream fork is pinned to
++// github.com/metacubex/quic-go and would pull a second, incompatible quic-go
++// into the build (sing-box uses github.com/sagernet/quic-go).
++//
++// Only the client-facing pieces are kept: the proxied Conn (IP packets over
++// HTTP Datagrams + Capsule Protocol), route/address capsules, IPv4 checksum
++// recomputation and the ICMP "packet too big" helper. The server/proxy side
++// (proxy.go, request.go) and the RFC-strict Dial (client.go) are intentionally
++// dropped — the dialing (with Cloudflare quirks) lives in transport/masque.
++//
++// License: MIT (connect-ip-go). See SPEC 021 for the porting notes.
++package connectip
++
++import (
++	"context"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/netip"
++	"sync"
++
++	"github.com/sagernet/quic-go"
++	"github.com/sagernet/quic-go/http3"
++	"github.com/sagernet/quic-go/quicvarint"
++
++	"golang.org/x/exp/slices"
++	"golang.org/x/net/ipv4"
++	"golang.org/x/net/ipv6"
++)
++
++// contextIDZero is the QUIC varint encoding of context ID 0, which prefixes
++// every proxied IP datagram (RFC 9484 §6).
++var contextIDZero = quicvarint.Append(nil, 0)
++
++type CloseError struct {
++	Remote bool
++}
++
++func (e *CloseError) Error() string        { return net.ErrClosed.Error() }
++func (e *CloseError) Is(target error) bool { return target == net.ErrClosed }
++
++type appendable interface{ append([]byte) []byte }
++
++type writeCapsule struct {
++	capsule appendable
++	result  chan error
++}
++
++const (
++	ipProtoICMP   = 1
++	ipProtoICMPv6 = 58
++)
++
++// Http3Stream is the minimal stream surface the proxied Conn needs. Both
++// *http3.Stream and *http3.RequestStream satisfy it.
++type Http3Stream interface {
++	io.ReadWriteCloser
++	ReceiveDatagram(context.Context) ([]byte, error)
++	SendDatagram([]byte) error
++	CancelRead(quic.StreamErrorCode)
++}
++
++var (
++	_ Http3Stream = &http3.Stream{}
++	_ Http3Stream = &http3.RequestStream{}
++)
++
++// If a packet is too large to fit into a QUIC datagram, we send an ICMP Packet
++// Too Big packet. On IPv6, the minimum MTU of a link is 1280 bytes: the ICMP
++// reply names the actual datagram budget but never less than this (see
++// icmpAdvertisedMTU). minMTU also bounds the header snapshot quoted back.
++const minMTU = 1280
++
++// icmpAdvertisedMTU converts quic-go's datagram budget (the
++// MaxDatagramPayloadSize of a DatagramTooLargeError) into the MTU an ICMP
++// "packet too big" reply should name: the budget minus the context-id prefix
++// every proxied packet carries, floored at minMTU. The stack will not go below
++// the IPv6 minimum anyway, and an honest smaller number only makes it retry
++// the same packet. lx: SPEC 120 §2.6 (before: always 1280, a defect from 107).
++func icmpAdvertisedMTU(budget int64) int {
++	mtu := int(budget) - len(contextIDZero)
++	if mtu < minMTU {
++		return minMTU
++	}
++	return mtu
++}
++
++// Conn is a connection that proxies IP packets over HTTP/3.
++type Conn struct {
++	str    Http3Stream
++	writes chan writeCapsule
++
++	mu                sync.Mutex
++	peerAddresses     []netip.Prefix
++	localRoutes       []IPRoute
++	assignedAddresses []netip.Prefix
++	availableRoutes   []IPRoute
++
++	closeChan chan struct{}
++	closeErr  error
++
++	// sendBuf is a reusable scratch for the outgoing datagram (contextID + IP
++	// packet). WritePacket is only ever called from the single tx pump, and
++	// quic-go copies the slice into its own frame before returning
++	// (connection.go SendDatagram), so one reused buffer is safe and avoids a
++	// per-packet allocation on the hot path. lx: SPEC 021 B3.
++	sendBuf []byte
++}
++
++// NewProxiedConn wraps an already-established CONNECT-IP request stream.
++func NewProxiedConn(str Http3Stream) *Conn {
++	c := &Conn{
++		str:       str,
++		writes:    make(chan writeCapsule),
++		closeChan: make(chan struct{}),
++	}
++	go func() {
++		if err := c.readFromStream(); err != nil {
++			c.mu.Lock()
++			if c.closeErr == nil {
++				c.closeErr = &CloseError{Remote: true}
++				close(c.closeChan)
++			}
++			c.mu.Unlock()
++		}
++	}()
++	go func() {
++		if err := c.writeToStream(); err != nil {
++			c.mu.Lock()
++			if c.closeErr == nil {
++				c.closeErr = &CloseError{Remote: true}
++				close(c.closeChan)
++			}
++			c.mu.Unlock()
++		}
++	}()
++	return c
++}
++
++// AdvertiseRoute informs the peer about available routes. Only the routes from
++// the most recent call are active.
++func (c *Conn) AdvertiseRoute(ctx context.Context, routes []IPRoute) error {
++	for _, route := range routes {
++		if route.StartIP.Compare(route.EndIP) == 1 {
++			return fmt.Errorf("invalid route advertising start_ip: %s larger than %s", route.StartIP, route.EndIP)
++		}
++	}
++	c.mu.Lock()
++	c.localRoutes = slices.Clone(routes)
++	c.mu.Unlock()
++	return c.sendCapsule(ctx, &routeAdvertisementCapsule{IPAddressRanges: routes})
++}
++
++func (c *Conn) sendCapsule(ctx context.Context, capsule appendable) error {
++	res := make(chan error, 1)
++	select {
++	case c.writes <- writeCapsule{capsule: capsule, result: res}:
++		select {
++		case <-ctx.Done():
++			return ctx.Err()
++		case err := <-res:
++			return err
++		}
++	case <-c.closeChan:
++		return c.closeErr
++	case <-ctx.Done():
++		return ctx.Err()
++	}
++}
++
++func (c *Conn) readFromStream() error {
++	defer c.str.Close()
++	// lx: quic-go v0.61 replaced the stateless http3.ParseCapsule(r) with a
++	// stateful CapsuleParser: the parser is created once and Next() advances it,
++	// returning a CapsuleReader valid only until the following Next(). Our
++	// parse*Capsule helpers take a quicvarint.Reader, which CapsuleReader
++	// satisfies, so only the loop head changes.
++	parser := http3.NewCapsuleParser(c.str)
++	for {
++		t, cr, err := parser.Next()
++		if err != nil {
++			return err
++		}
++		switch t {
++		case capsuleTypeAddressAssign:
++			capsule, err := parseAddressAssignCapsule(cr)
++			if err != nil {
++				return err
++			}
++			prefixes := make([]netip.Prefix, 0, len(capsule.AssignedAddresses))
++			for _, assigned := range capsule.AssignedAddresses {
++				prefixes = append(prefixes, assigned.IPPrefix)
++			}
++			c.mu.Lock()
++			c.assignedAddresses = prefixes
++			c.mu.Unlock()
++		case capsuleTypeAddressRequest:
++			return errors.New("connect-ip: address request not yet supported")
++		case capsuleTypeRouteAdvertisement:
++			capsule, err := parseRouteAdvertisementCapsule(cr)
++			if err != nil {
++				return err
++			}
++			c.mu.Lock()
++			c.availableRoutes = capsule.IPAddressRanges
++			c.mu.Unlock()
++		default:
++			return fmt.Errorf("unknown capsule type: %d", t)
++		}
++	}
++}
++
++func (c *Conn) writeToStream() error {
++	buf := make([]byte, 0, 1024)
++	for {
++		select {
++		case <-c.closeChan:
++			return c.closeErr
++		case req, ok := <-c.writes:
++			if !ok {
++				return nil
++			}
++			buf = req.capsule.append(buf[:0])
++			_, err := c.str.Write(buf)
++			req.result <- err
++			if err != nil {
++				return err
++			}
++		}
++	}
++}
++
++// ReadPacket reads a single proxied IP packet from the tunnel.
++func (c *Conn) ReadPacket() (b []byte, err error) {
++start:
++	data, err := c.str.ReceiveDatagram(context.Background())
++	if err != nil {
++		select {
++		case <-c.closeChan:
++			return nil, c.closeErr
++		default:
++			return nil, err
++		}
++	}
++	contextID, n, err := quicvarint.Parse(data)
++	if err != nil {
++		// A single malformed/empty datagram (unparseable context-ID varint) must
++		// NOT tear down the tunnel — drop it and continue, like the sibling
++		// context-ID!=0 and bad-payload cases. (lx: SPEC 021 A1. Upstream
++		// connect-ip-go returns here with a "// TODO: close connection", but in
++		// this integration the pump has no restart loop, so a return would
++		// blackhole the outbound permanently on one bad packet.)
++		goto start
++	}
++	if contextID != 0 {
++		// We only support proxying of IP payloads (context ID 0).
++		goto start
++	}
++	if err := c.handleIncomingProxiedPacket(data[n:]); err != nil {
++		goto start
++	}
++	return data[n:], nil
++}
++
++func (c *Conn) handleIncomingProxiedPacket(data []byte) error {
++	if len(data) == 0 {
++		return errors.New("connect-ip: empty packet")
++	}
++	var src, dst netip.Addr
++	var ipProto uint8
++	version := ipVersion(data)
++	switch version {
++	default:
++		return fmt.Errorf("connect-ip: unknown IP versions: %d", version)
++	case 4:
++		if len(data) < ipv4.HeaderLen {
++			return fmt.Errorf("connect-ip: malformed datagram: too short")
++		}
++		src = netip.AddrFrom4([4]byte(data[12:16]))
++		dst = netip.AddrFrom4([4]byte(data[16:20]))
++		ipProto = data[9]
++	case 6:
++		if len(data) < ipv6.HeaderLen {
++			return fmt.Errorf("connect-ip: malformed datagram: too short")
++		}
++		src = netip.AddrFrom16([16]byte(data[8:24]))
++		dst = netip.AddrFrom16([16]byte(data[24:40]))
++		ipProto = data[6]
++	}
++
++	c.mu.Lock()
++	assignedAddresses := c.assignedAddresses
++	localRoutes := c.localRoutes
++	peerAddresses := c.peerAddresses
++	c.mu.Unlock()
++
++	if peerAddresses != nil {
++		if !slices.ContainsFunc(peerAddresses, func(p netip.Prefix) bool { return p.Contains(src) }) {
++			return fmt.Errorf("connect-ip: datagram source address not allowed: %s", src)
++		}
++	}
++
++	var isAllowedDst bool
++	if len(assignedAddresses) > 0 {
++		isAllowedDst = slices.ContainsFunc(assignedAddresses, func(p netip.Prefix) bool { return p.Contains(dst) })
++	}
++	if !isAllowedDst {
++		isICMP := (version == 4 && ipProto == ipProtoICMP) || (version == 6 && ipProto == ipProtoICMPv6)
++		isAllowedDst = slices.ContainsFunc(localRoutes, func(r IPRoute) bool {
++			if r.StartIP.Compare(dst) > 0 || dst.Compare(r.EndIP) > 0 {
++				return false
++			}
++			if isICMP {
++				return true
++			}
++			return r.IPProtocol == 0 || r.IPProtocol == ipProto
++		})
++	}
++	if !isAllowedDst {
++		return fmt.Errorf("connect-ip: datagram destination address / protocol not allowed: %s (protocol: %d)", dst, ipProto)
++	}
++	return nil
++}
++
++// WritePacket writes an IP packet to the stream. If the packet is too large it
++// returns an ICMP "packet too big" reply the caller should feed back locally.
++func (c *Conn) WritePacket(b []byte) (icmp []byte, err error) {
++	// Snapshot the original header BEFORE composeDatagram mutates b in place
++	// (TTL/hop-limit decrement + checksum rewrite), so a potential ICMP "packet
++	// too big" reply quotes the datagram as the app sent it (RFC 1191/792).
++	// lx: SPEC 021 A3.
++	var origHead []byte
++	if len(b) > 0 {
++		snapLen := len(b)
++		if snapLen > minMTU {
++			snapLen = minMTU
++		}
++		origHead = append(origHead, b[:snapLen]...)
++	}
++
++	data, err := c.composeDatagram(b)
++	if err != nil {
++		return nil, nil
++	}
++	if data == nil {
++		return nil, nil
++	}
++	if err := c.str.SendDatagram(data); err != nil {
++		var errDTL *quic.DatagramTooLargeError
++		if errors.As(err, &errDTL) {
++			// lx: SPEC 120 §2.6 — name the real budget, not the 1280 constant, so
++			// the stack learns the size that would actually have gone through.
++			icmpPacket, cerr := composeICMPTooLargePacket(origHead, icmpAdvertisedMTU(errDTL.MaxDatagramPayloadSize))
++			if cerr != nil {
++				return nil, nil
++			}
++			return icmpPacket, nil
++		}
++		select {
++		case <-c.closeChan:
++			return nil, c.closeErr
++		default:
++			return nil, err
++		}
++	}
++	return nil, nil
++}
++
++func (c *Conn) composeDatagram(b []byte) ([]byte, error) {
++	if len(b) == 0 {
++		return nil, nil
++	}
++	switch v := ipVersion(b); v {
++	default:
++		return nil, fmt.Errorf("connect-ip: unknown IP versions: %d", v)
++	case 4:
++		if len(b) < ipv4.HeaderLen {
++			return nil, fmt.Errorf("connect-ip: IPv4 packet too short")
++		}
++		// IHL*4 is the real header length; recompute the checksum over it so options
++		// (IHL>5) are covered (SPEC 022 #6). Reject a header length that overruns the
++		// buffer before it can drive an out-of-bounds read.
++		ihl := int(b[0]&0x0f) * 4
++		if ihl < ipv4.HeaderLen || ihl > len(b) {
++			return nil, fmt.Errorf("connect-ip: invalid IPv4 header length: %d", ihl)
++		}
++		ttl := b[8]
++		if ttl <= 1 {
++			return nil, fmt.Errorf("connect-ip: datagram TTL too small: %d", ttl)
++		}
++		b[8]-- // decrement TTL
++		binary.BigEndian.PutUint16(b[10:12], calculateIPv4Checksum(b[:ihl]))
++	case 6:
++		if len(b) < ipv6.HeaderLen {
++			return nil, fmt.Errorf("connect-ip: IPv6 packet too short")
++		}
++		hopLimit := b[7]
++		if hopLimit <= 1 {
++			return nil, fmt.Errorf("connect-ip: datagram Hop Limit too small: %d", hopLimit)
++		}
++		b[7]-- // decrement Hop Limit
++	}
++	// Reuse the scratch buffer: contextID (0) + IP packet. Safe because quic-go
++	// copies the slice into its own datagram frame before SendDatagram returns.
++	need := len(contextIDZero) + len(b)
++	if cap(c.sendBuf) < need {
++		c.sendBuf = make([]byte, 0, need)
++	}
++	data := c.sendBuf[:0]
++	data = append(data, contextIDZero...)
++	data = append(data, b...)
++	c.sendBuf = data
++	return data, nil
++}
++
++// Close tears down the tunnel.
++func (c *Conn) Close() error {
++	c.mu.Lock()
++	if c.closeErr == nil {
++		c.closeErr = &CloseError{Remote: false}
++		close(c.closeChan)
++	}
++	c.mu.Unlock()
++	c.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
++	return c.str.Close()
++}
++
++func ipVersion(b []byte) uint8 { return b[0] >> 4 }
+diff --git a/transport/masque/connectip/packet.go b/transport/masque/connectip/packet.go
+new file mode 100644
+index 000000000..025da12ec
+--- /dev/null
++++ b/transport/masque/connectip/packet.go
+@@ -0,0 +1,107 @@
++package connectip
++
++// Vendored from connect-ip-go (MIT). IP packet rewrite helpers shared by the
++// CONNECT-IP data path: the IPv4 header checksum recomputed after a TTL
++// decrement, and the ICMP "packet too big" reply synthesized when an outgoing
++// packet exceeds the tunnel's datagram budget.
++
++import (
++	"encoding/binary"
++	"errors"
++	"fmt"
++
++	"golang.org/x/net/icmp"
++	"golang.org/x/net/ipv4"
++	"golang.org/x/net/ipv6"
++)
++
++// ---- IPv4 header checksum ----
++
++// calculateIPv4Checksum recomputes the IPv4 header checksum over the whole
++// header the caller passes (header[:IHL*4]), so options (IHL>5) are covered.
++// lx: SPEC 022 #6 — the vendored original took a fixed [20]byte and summed only
++// the first 20 bytes, yielding a wrong checksum when options were present. The
++// checksum field itself (offset 10-11) is skipped.
++func calculateIPv4Checksum(header []byte) uint16 {
++	var sum uint32
++	for i := 0; i+1 < len(header); i += 2 {
++		if i == 10 {
++			continue // skip checksum field
++		}
++		sum += uint32(binary.BigEndian.Uint16(header[i : i+2]))
++	}
++	for (sum >> 16) > 0 {
++		sum = (sum & 0xffff) + (sum >> 16)
++	}
++	return ^uint16(sum)
++}
++
++// ---- ICMP packet too big ----
++
++// composeICMPTooLargePacket builds an ICMP "packet too big" reply when an
++// outgoing IP packet exceeds the tunnel's datagram size.
++func composeICMPTooLargePacket(b []byte, mtu int) ([]byte, error) {
++	if len(b) == 0 {
++		return nil, errors.New("connect-ip: empty packet")
++	}
++
++	var icmpMessage *icmp.Message
++	var psh []byte
++	switch v := ipVersion(b); v {
++	case 4:
++		if len(b) < ipv4.HeaderLen {
++			return nil, errors.New("connect-ip: IPv4 packet too short")
++		}
++		icmpMessage = &icmp.Message{
++			Type: ipv4.ICMPTypeDestinationUnreachable,
++			Code: 4, // Fragmentation Needed and Don't Fragment was Set
++			Body: &icmp.PacketTooBig{
++				MTU:  mtu,
++				Data: b[:min(len(b), ipv4.HeaderLen+8)],
++			},
++		}
++	case 6:
++		if len(b) < ipv6.HeaderLen {
++			return nil, errors.New("connect-ip: IPv6 packet too short")
++		}
++		icmpMessage = &icmp.Message{
++			Type: ipv6.ICMPTypePacketTooBig,
++			Body: &icmp.PacketTooBig{
++				MTU: mtu,
++				// 1232 = minMTU(1280) − IPv6 header(40) − ICMPv6 header(8): the most
++				// quoted data that keeps the ICMPv6 reply within the min IPv6 MTU (RFC 4443).
++				Data: b[:min(len(b), 1232)],
++			},
++		}
++		psh = icmp.IPv6PseudoHeader(b[24:40], b[8:24])
++	default:
++		return nil, fmt.Errorf("connect-ip: unknown IP version: %d", v)
++	}
++
++	icmpBytes, err := icmpMessage.Marshal(psh)
++	if err != nil {
++		return nil, fmt.Errorf("connect-ip: failed to marshal ICMP message: %w", err)
++	}
++
++	if ipVersion(b) == 4 {
++		var header [ipv4.HeaderLen]byte
++		header[0] = 4<<4 | ipv4.HeaderLen>>2 // Version and IHL
++		ipLen := ipv4.HeaderLen + len(icmpBytes)
++		binary.BigEndian.PutUint16(header[2:4], uint16(ipLen)) // Total Length
++		header[8] = 64                                         // TTL
++		header[9] = 1                                          // Protocol (ICMP)
++		copy(header[12:16], b[16:20])                          // Source IP (swapped)
++		copy(header[16:20], b[12:16])                          // Dest IP (swapped)
++		binary.BigEndian.PutUint16(header[10:12], calculateIPv4Checksum(header[:]))
++		return append(header[:], icmpBytes...), nil
++	}
++
++	var header [ipv6.HeaderLen]byte
++	header[0] = 6 << 4                                              // Version 6
++	binary.BigEndian.PutUint16(header[4:6], uint16(len(icmpBytes))) // Payload Length
++	header[6] = 58                                                  // Next Header (ICMPv6)
++	header[7] = 64                                                  // Hop Limit
++	copy(header[8:24], b[24:40])                                    // Source IP (swapped)
++	copy(header[24:40], b[8:24])                                    // Dest IP (swapped)
++	return append(header[:], icmpBytes...), nil
++}
+diff --git a/transport/masque/connectip/packet_test.go b/transport/masque/connectip/packet_test.go
+new file mode 100644
+index 000000000..50f718334
+--- /dev/null
++++ b/transport/masque/connectip/packet_test.go
+@@ -0,0 +1,206 @@
++package connectip
++
++import (
++	"context"
++	"encoding/binary"
++	"sync"
++	"testing"
++
++	"github.com/sagernet/quic-go"
++
++	"golang.org/x/net/icmp"
++	"golang.org/x/net/ipv4"
++	"golang.org/x/net/ipv6"
++)
++
++// lx: SPEC 120 §2.6 — the ICMP "packet too big" reply names quic-go's actual
++// datagram budget minus the context-id byte, floored at the IPv6 minimum.
++func TestICMPAdvertisedMTU(t *testing.T) {
++	t.Parallel()
++	cases := []struct {
++		budget int64
++		want   int
++	}{
++		{1310, 1309},
++		{1281, 1280},
++		{1205, 1280}, // below the floor: never advertise under 1280
++		{0, 1280},
++		{1452, 1451},
++	}
++	for _, tc := range cases {
++		if got := icmpAdvertisedMTU(tc.budget); got != tc.want {
++			t.Errorf("icmpAdvertisedMTU(%d) = %d, want %d", tc.budget, got, tc.want)
++		}
++	}
++}
++
++// tooLargeStream is an Http3Stream whose SendDatagram always reports the
++// given budget; the capsule side blocks until Close so the Conn stays open.
++type tooLargeStream struct {
++	budget    int64
++	closeOnce sync.Once
++	closed    chan struct{}
++}
++
++func newTooLargeStream(budget int64) *tooLargeStream {
++	return &tooLargeStream{budget: budget, closed: make(chan struct{})}
++}
++
++func (s *tooLargeStream) Read([]byte) (int, error) {
++	<-s.closed
++	return 0, context.Canceled
++}
++
++func (s *tooLargeStream) Write(b []byte) (int, error) { return len(b), nil }
++
++func (s *tooLargeStream) Close() error {
++	s.closeOnce.Do(func() { close(s.closed) })
++	return nil
++}
++
++func (s *tooLargeStream) ReceiveDatagram(ctx context.Context) ([]byte, error) {
++	select {
++	case <-s.closed:
++		return nil, context.Canceled
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	}
++}
++
++func (s *tooLargeStream) SendDatagram([]byte) error {
++	return &quic.DatagramTooLargeError{MaxDatagramPayloadSize: s.budget}
++}
++
++func (s *tooLargeStream) CancelRead(quic.StreamErrorCode) {}
++
++func ipv6Packet(size int) []byte {
++	b := make([]byte, size)
++	b[0] = 6 << 4
++	binary.BigEndian.PutUint16(b[4:6], uint16(size-ipv6.HeaderLen))
++	b[6] = 17 // UDP
++	b[7] = 64
++	b[8+15] = 1  // src ::1
++	b[24+15] = 2 // dst ::2
++	return b
++}
++
++func ipv4Packet(size int) []byte {
++	b := make([]byte, size)
++	b[0] = 4<<4 | ipv4.HeaderLen>>2
++	binary.BigEndian.PutUint16(b[2:4], uint16(size))
++	b[8] = 64
++	b[9] = 17 // UDP
++	copy(b[12:16], []byte{10, 0, 0, 1})
++	copy(b[16:20], []byte{10, 0, 0, 2})
++	return b
++}
++
++// WritePacket through a Conn: the reply carries the advertised MTU, for both
++// families, and quotes the packet with the original hop limit / TTL.
++func TestWritePacketTooBigAdvertisesBudget(t *testing.T) {
++	t.Parallel()
++	cases := []struct {
++		name   string
++		budget int64
++		want   int
++	}{
++		{"budget 1310", 1310, 1309},
++		{"budget 1205 floors at 1280", 1205, 1280},
++	}
++	for _, tc := range cases {
++		t.Run(tc.name+" ipv6", func(t *testing.T) {
++			conn := NewProxiedConn(newTooLargeStream(tc.budget))
++			defer conn.Close()
++			reply, err := conn.WritePacket(ipv6Packet(1280))
++			if err != nil {
++				t.Fatalf("WritePacket: %v", err)
++			}
++			if len(reply) < ipv6.HeaderLen+8 || reply[0]>>4 != 6 || reply[6] != ipProtoICMPv6 {
++				t.Fatalf("not an ICMPv6 reply: % x", reply[:min(len(reply), 48)])
++			}
++			msg, err := icmp.ParseMessage(ipProtoICMPv6, reply[ipv6.HeaderLen:])
++			if err != nil {
++				t.Fatalf("parse ICMPv6: %v", err)
++			}
++			if msg.Type != ipv6.ICMPTypePacketTooBig {
++				t.Fatalf("type = %v, want PacketTooBig", msg.Type)
++			}
++			body := msg.Body.(*icmp.PacketTooBig)
++			if body.MTU != tc.want {
++				t.Fatalf("MTU = %d, want %d", body.MTU, tc.want)
++			}
++			if body.Data[7] != 64 {
++				t.Fatalf("quoted hop limit = %d, want the original 64", body.Data[7])
++			}
++		})
++		t.Run(tc.name+" ipv4", func(t *testing.T) {
++			conn := NewProxiedConn(newTooLargeStream(tc.budget))
++			defer conn.Close()
++			reply, err := conn.WritePacket(ipv4Packet(1280))
++			if err != nil {
++				t.Fatalf("WritePacket: %v", err)
++			}
++			if len(reply) < ipv4.HeaderLen+8 || reply[0]>>4 != 4 || reply[9] != ipProtoICMP {
++				t.Fatalf("not an ICMPv4 reply: % x", reply[:min(len(reply), 28)])
++			}
++			msg := reply[ipv4.HeaderLen:]
++			if msg[0] != byte(ipv4.ICMPTypeDestinationUnreachable) || msg[1] != 4 {
++				t.Fatalf("type/code = %d/%d, want 3/4", msg[0], msg[1])
++			}
++			// RFC 1191: next-hop MTU in the low 16 bits of the unused field.
++			if got := int(binary.BigEndian.Uint16(msg[6:8])); got != tc.want {
++				t.Fatalf("MTU = %d, want %d", got, tc.want)
++			}
++			if msg[8+8] != 64 {
++				t.Fatalf("quoted TTL = %d, want the original 64", msg[8+8])
++			}
++		})
++	}
++}
++
++func TestIPv4Checksum(t *testing.T) {
++	t.Parallel()
++	// A well-formed IPv4 header (from RFC examples): checksum field zeroed.
++	header := [20]byte{
++		0x45, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00,
++		0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00, 0x01,
++		0xc0, 0xa8, 0x00, 0xc7,
++	}
++	got := calculateIPv4Checksum(header[:])
++	if got != 0xb861 {
++		t.Fatalf("checksum = %#x, want 0xb861", got)
++	}
++}
++
++// TestIPv4ChecksumWithOptions covers a header carrying an IPv4 option (IHL=6, so
++// 24 bytes): the checksum must fold in the option word, not just the first 20
++// bytes (SPEC 022 #6). Expected value is the ones-complement sum over all 24
++// bytes with the checksum field zeroed.
++func TestIPv4ChecksumWithOptions(t *testing.T) {
++	t.Parallel()
++	header := []byte{
++		0x46, 0x00, 0x00, 0x77, 0x00, 0x00, 0x40, 0x00, // IHL=6 (0x46)
++		0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8, 0x00, 0x01,
++		0xc0, 0xa8, 0x00, 0xc7,
++		0x94, 0x04, 0x00, 0x00, // option: Router Alert (type 0x94, len 4)
++	}
++	// Independent reference sum over the 24 bytes, checksum field (10-11) zeroed.
++	var sum uint32
++	for i := 0; i+1 < len(header); i += 2 {
++		if i == 10 {
++			continue
++		}
++		sum += uint32(header[i])<<8 | uint32(header[i+1])
++	}
++	for sum>>16 > 0 {
++		sum = (sum & 0xffff) + (sum >> 16)
++	}
++	want := ^uint16(sum)
++	if got := calculateIPv4Checksum(header); got != want {
++		t.Fatalf("checksum over IHL=6 header = %#x, want %#x", got, want)
++	}
++	// The 20-byte-only sum would differ, proving the option word is now covered.
++	if want == calculateIPv4Checksum(header[:20]) {
++		t.Fatal("option word did not change the checksum — coverage not exercised")
++	}
++}
+diff --git a/transport/masque/masque.go b/transport/masque/masque.go
+new file mode 100644
+index 000000000..2efce6602
+--- /dev/null
++++ b/transport/masque/masque.go
+@@ -0,0 +1,199 @@
++// Package masque implements a CONNECT-IP (RFC 9484) client for MASQUE
++// outbounds, primarily targeting Cloudflare WARP. It carries whole IP packets
++// over an HTTP/3 (or HTTP/2) tunnel using HTTP Datagrams and the Capsule
++// Protocol.
++//
++// This is NOT CONNECT-UDP (RFC 9298). See SPEC 021.
++//
++// The CONNECT-IP wire logic is vendored under ./connectip (ported from
++// connect-ip-go). This file holds the dialing that layers the profile quirks
++// (Cloudflare vs standard) on top.
++package masque
++
++import (
++	"context"
++	"errors"
++	"net/http"
++	"net/netip"
++	"net/url"
++	"strings"
++
++	"github.com/sagernet/quic-go"
++	"github.com/sagernet/quic-go/http3"
++	"github.com/sagernet/sing-box/transport/masque/connectip"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// IpConn is the transport-agnostic surface the outbound pumps IP packets
++// through. Both the HTTP/3 connectip.Conn and the HTTP/2 shim satisfy it.
++type IpConn interface {
++	ReadPacket() (b []byte, err error)
++	WritePacket(b []byte) (icmp []byte, err error)
++	Close() error
++}
++
++// ConnectTunnelH3 establishes a CONNECT-IP tunnel over an existing HTTP/3
++// (QUIC) connection and advertises a default route so all traffic is tunnelled.
++// It returns the http3 transport (for lifetime management) and the IP conn.
++func ConnectTunnelH3(ctx context.Context, profile Profile, quicConn *quic.Conn, connectURI string) (*http3.Transport, IpConn, error) {
++	tr := &http3.Transport{
++		EnableDatagrams: true,
++		AdditionalSettings: map[uint64]uint64{
++			// The official client still advertises the deprecated
++			// SETTINGS_H3_DATAGRAM_00 (0x276); WARP expects it.
++			0x276: 1,
++		},
++		DisableCompression: true,
++	}
++
++	hconn := tr.NewClientConn(quicConn)
++
++	ipConn, err := dialCONNECTIP(ctx, profile, hconn, connectURI)
++	if err != nil {
++		_ = tr.Close()
++		// Match the inner TLS alert as a substring, not the whole formatted error:
++		// quic-go wraps it as "CRYPTO_ERROR 0x131 (remote): tls: access denied" and a
++		// version bump can reformat that wrapper without changing the alert (SPEC 022 #22).
++		if strings.Contains(err.Error(), "tls: access denied") {
++			return nil, nil, E.New("masque: login failed — verify the TLS key/cert is enrolled with Cloudflare Access")
++		}
++		// An idle timeout here means the endpoint took the QUIC connection (we
++		// could not have reached CONNECT-IP otherwise) and then answered
++		// nothing at all — seen on paths where the same endpoint serves h2 from
++		// the same address. The default wrapping buries that behind
++		// "dial connect-ip: read response: http3: parsing frame failed", which
++		// reads like a framing bug rather than a silent peer. Unlike the TLS
++		// alert above this one is a real type, so match it as one. lx.
++		var idleErr *quic.IdleTimeoutError
++		if errors.As(err, &idleErr) {
++			return nil, nil, E.Cause(err, "masque: CONNECT-IP timed out")
++		}
++		return nil, nil, E.Cause(err, "masque: dial connect-ip")
++	}
++
++	if err = advertiseDefaultRoute(ctx, ipConn); err != nil {
++		_ = ipConn.Close()
++		_ = tr.Close()
++		return nil, nil, err
++	}
++
++	return tr, ipConn, nil
++}
++
++// dialCONNECTIP sends the Extended CONNECT request and wraps the request stream
++// into a proxied IP connection.
++func dialCONNECTIP(ctx context.Context, profile Profile, conn *http3.ClientConn, connectURI string) (*connectip.Conn, error) {
++	u, err := url.Parse(connectURI)
++	if err != nil {
++		return nil, E.Cause(err, "parse connect uri")
++	}
++
++	select {
++	case <-ctx.Done():
++		return nil, context.Cause(ctx)
++	case <-conn.Context().Done():
++		return nil, context.Cause(conn.Context())
++	case <-conn.ReceivedSettings():
++	}
++	settings := conn.Settings()
++	if !profile.IgnoreExtendedConnect && !settings.EnableExtendedConnect {
++		return nil, E.New("connect-ip: server didn't enable Extended CONNECT")
++	}
++	if !settings.EnableDatagrams {
++		return nil, E.New("connect-ip: server didn't enable datagrams")
++	}
++
++	rstr, err := conn.OpenRequestStream(ctx)
++	if err != nil {
++		return nil, E.Cause(err, "open request stream")
++	}
++
++	req := buildConnectIPRequest(profile, u)
++	if err = rstr.SendRequestHeader(req); err != nil {
++		return nil, E.Cause(err, "send request header")
++	}
++	rsp, err := readResponse(ctx, rstr)
++	if err != nil {
++		return nil, E.Cause(err, "read response")
++	}
++	if rsp.StatusCode < 200 || rsp.StatusCode > 299 {
++		return nil, E.New("connect-ip: server responded with ", rsp.StatusCode)
++	}
++	return connectip.NewProxiedConn(rstr), nil
++}
++
++// responseStream is the part of http3.RequestStream readResponse needs.
++type responseStream interface {
++	ReadResponse() (*http.Response, error)
++	CancelRead(errorCode quic.StreamErrorCode)
++	CancelWrite(errorCode quic.StreamErrorCode)
++}
++
++// readResponse is ReadResponse bound to ctx. lx: SPEC 108 — ReadResponse takes
++// no context, so an endpoint that completes the QUIC handshake, keeps
++// acknowledging keepalives and never answers the CONNECT held the dial for as
++// long as the connection lived: the caller's deadline did not apply, every dial
++// of the node queued behind it, and in `auto` the abandoned h3 leg leaked with
++// its QUIC connection. Cancelling the stream is what unblocks the read.
++func readResponse(ctx context.Context, stream responseStream) (*http.Response, error) {
++	stop := context.AfterFunc(ctx, func() {
++		stream.CancelRead(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
++		stream.CancelWrite(quic.StreamErrorCode(http3.ErrCodeRequestCanceled))
++	})
++	response, err := stream.ReadResponse()
++	if !stop() {
++		// The stream is cancelled (or about to be) — unusable even if the
++		// response slipped in at the same moment.
++		return nil, context.Cause(ctx)
++	}
++	return response, err
++}
++
++// ---- CONNECT-IP request construction ----
++
++// capsuleProtocolHeaderValue is the structured-field boolean true ("?1") sent in
++// the Capsule-Protocol request header (RFC 9297).
++const capsuleProtocolHeaderValue = "?1"
++
++// buildConnectIPRequest constructs the Extended CONNECT request for a profile.
++func buildConnectIPRequest(profile Profile, u *url.URL) *http.Request {
++	header := http.Header{
++		http3.CapsuleProtocolHeader: []string{capsuleProtocolHeaderValue},
++		// The official WARP client sends an empty User-Agent.
++		"User-Agent": []string{""},
++	}
++	return &http.Request{
++		Method: http.MethodConnect,
++		Proto:  profile.RequestProtocol,
++		Host:   u.Host,
++		Header: header,
++		URL:    u,
++	}
++}
++
++// advertiseDefaultRoute tells the peer we accept all IPv4/IPv6 traffic, so the
++// endpoint routes everything through the tunnel.
++func advertiseDefaultRoute(ctx context.Context, ipConn IpConn) error {
++	adv, ok := ipConn.(interface {
++		AdvertiseRoute(context.Context, []connectip.IPRoute) error
++	})
++	if !ok {
++		// The tunnel implementation does not support route advertisement.
++		return nil
++	}
++	return adv.AdvertiseRoute(ctx, []connectip.IPRoute{
++		{
++			IPProtocol: 0,
++			StartIP:    netip.AddrFrom4([4]byte{}),
++			EndIP:      netip.AddrFrom4([4]byte{255, 255, 255, 255}),
++		},
++		{
++			IPProtocol: 0,
++			StartIP:    netip.AddrFrom16([16]byte{}),
++			EndIP: netip.AddrFrom16([16]byte{
++				255, 255, 255, 255, 255, 255, 255, 255,
++				255, 255, 255, 255, 255, 255, 255, 255,
++			}),
++		},
++	})
++}
+diff --git a/transport/masque/masque_test.go b/transport/masque/masque_test.go
+new file mode 100644
+index 000000000..324066463
+--- /dev/null
++++ b/transport/masque/masque_test.go
+@@ -0,0 +1,115 @@
++package masque
++
++// Regression tests for the CONNECT-IP dial path: a peer that never answers the
++// Extended CONNECT must not hang the dial (SPEC 108), and a silent endpoint must
++// be reported as an idle timeout rather than a frame-parsing failure.
++
++import (
++	"context"
++	"errors"
++	"fmt"
++	"net/http"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/quic-go"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// blockingStream answers ReadResponse only when cancelled, like an endpoint that
++// took the connection and never replied to the CONNECT.
++type blockingStream struct {
++	cancelled chan struct{}
++	once      sync.Once
++	response  *http.Response
++}
++
++func (s *blockingStream) ReadResponse() (*http.Response, error) {
++	if s.response != nil {
++		return s.response, nil
++	}
++	<-s.cancelled
++	return nil, errors.New("stream cancelled")
++}
++
++func (s *blockingStream) CancelRead(quic.StreamErrorCode) {
++	s.once.Do(func() { close(s.cancelled) })
++}
++
++func (s *blockingStream) CancelWrite(quic.StreamErrorCode) {}
++
++func TestReadResponseHonoursContext(t *testing.T) {
++	stream := &blockingStream{cancelled: make(chan struct{})}
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++	done := make(chan error, 1)
++	go func() {
++		_, err := readResponse(ctx, stream)
++		done <- err
++	}()
++	select {
++	case err := <-done:
++		if !errors.Is(err, context.DeadlineExceeded) {
++			t.Fatalf("want the context's error, got %v", err)
++		}
++	case <-time.After(3 * time.Second):
++		t.Fatal("readResponse ignored the context")
++	}
++}
++
++// Once the response is in, a later cancel of the dial context must not touch
++// the stream: the tunnel outlives the dial.
++func TestReadResponseReleasesStreamOnSuccess(t *testing.T) {
++	stream := &blockingStream{
++		cancelled: make(chan struct{}),
++		response:  &http.Response{StatusCode: http.StatusOK},
++	}
++	ctx, cancel := context.WithCancel(context.Background())
++	response, err := readResponse(ctx, stream)
++	if err != nil || response.StatusCode != http.StatusOK {
++		t.Fatalf("response=%v err=%v", response, err)
++	}
++	cancel()
++	select {
++	case <-stream.cancelled:
++		t.Fatal("dial context cancelled a live stream")
++	case <-time.After(100 * time.Millisecond):
++	}
++}
++
++// ---- idle timeout diagnosis ----
++
++// wrapLikeDialCONNECTIP reproduces the wrapping a real idle timeout goes
++// through before ConnectTunnelH3 inspects it.
++func wrapLikeDialCONNECTIP(inner error) error {
++	return E.Cause(fmt.Errorf("http3: parsing frame failed: %w", inner), "read response")
++}
++
++// TestIdleTimeoutMessageKeepsCause: the diagnosis replaces the leading context,
++// not the chain — the underlying timeout must stay readable.
++func TestIdleTimeoutMessageKeepsCause(t *testing.T) {
++	t.Parallel()
++	wrapped := wrapLikeDialCONNECTIP(&quic.IdleTimeoutError{})
++	got := E.Cause(wrapped, "masque: CONNECT-IP timed out").Error()
++
++	if !strings.HasPrefix(got, "masque: CONNECT-IP timed out") {
++		t.Errorf("diagnosis must lead the message, got %q", got)
++	}
++	if !strings.Contains(got, "timeout: no recent network activity") {
++		t.Errorf("original cause must survive, got %q", got)
++	}
++}
++
++// TestNonIdleErrorIsNotClaimedAsTimeout: any other failure must keep falling
++// through to the generic wrapping, or a real bug would be mislabelled.
++func TestNonIdleErrorIsNotClaimedAsTimeout(t *testing.T) {
++	t.Parallel()
++	err := wrapLikeDialCONNECTIP(errors.New("connect-ip: server responded with 403"))
++
++	var idleErr *quic.IdleTimeoutError
++	if errors.As(err, &idleErr) {
++		t.Fatal("a non-timeout failure must not match the idle-timeout branch")
++	}
++}
+diff --git a/transport/masque/profile.go b/transport/masque/profile.go
+new file mode 100644
+index 000000000..3202a1c28
+--- /dev/null
++++ b/transport/masque/profile.go
+@@ -0,0 +1,171 @@
++package masque
++
++import (
++	"crypto/ecdsa"
++	"crypto/rand"
++	"crypto/tls"
++	"crypto/x509"
++	"errors"
++	"math/big"
++	"time"
++
++	"github.com/sagernet/quic-go/http3"
++	E "github.com/sagernet/sing/common/exceptions"
++)
++
++// Cloudflare WARP MASQUE defaults.
++const (
++	// CloudflareConnectSNI is the endpoint's own name. Kept for reference: the
++	// endpoint is authenticated by pinning its public key, never by this name,
++	// so nothing requires sending it.
++	//
++	// lx: it is deliberately NOT the default. Sending it is what censors look
++	// for — measured 2026-08-12 from two unrelated Russian uplinks (home ISP and
++	// a mobile carrier), h3 to the same endpoint dies with a silent CONNECT-IP
++	// timeout under this name while yandex.ru, www.google.com, www.apple.com,
++	// cdn.jsdelivr.net, rutube.ru and www.cloudflare.com all connect. The
++	// endpoint serves the tunnel regardless of the name presented. See SPEC 021.
++	CloudflareConnectSNI = "consumer-masque.cloudflareclient.com"
++	// CloudflareDefaultSNI is what we actually send when the config sets no
++	// `sni`. Any neutral name works; this one is a plain Cloudflare property, so
++	// the traffic looks like ordinary CDN traffic and needs no third-party
++	// domain. Override per node with `sni` (LxBox rotates a pool).
++	CloudflareDefaultSNI = "www.cloudflare.com"
++	// CloudflareConnectURI is the default CONNECT-IP request URI for WARP.
++	CloudflareConnectURI = "https://cloudflareaccess.com"
++)
++
++// Profile selects the behavioural quirks of the CONNECT-IP dial. It varies four
++// things; everything else (QUIC, http3, capsule/datagram, the userspace stack)
++// is profile-independent. See SPEC 021.
++type Profile struct {
++	// RequestProtocol is the :protocol value of the Extended CONNECT request.
++	// Cloudflare uses "cf-connect-ip"; RFC 9484 uses "connect-ip".
++	RequestProtocol string
++	// IgnoreExtendedConnect skips the "server enabled Extended CONNECT" check.
++	// Cloudflare WARP does not send the setting, violating the RFC, so a strict
++	// client would refuse; we tolerate it for the cloudflare profile.
++	IgnoreExtendedConnect bool
++	// H3ConnectProto, when non-empty, is sent as the HTTP/2 "cf-connect-proto"
++	// header on the h2 path (Cloudflare-specific).
++	H2ConnectProto string
++	// DefaultSNI / DefaultURI are used when the config leaves sni/uri empty.
++	DefaultSNI string
++	DefaultURI string
++	// PinPublicKey enables ECDSA public-key pinning against the endpoint's
++	// certificate (Cloudflare Access model) instead of normal chain validation.
++	PinPublicKey bool
++}
++
++// ProfileCloudflare matches Cloudflare WARP's non-RFC-compliant CONNECT-IP.
++func ProfileCloudflare() Profile {
++	return Profile{
++		RequestProtocol:       "cf-connect-ip",
++		IgnoreExtendedConnect: true,
++		H2ConnectProto:        "cf-connect-ip",
++		DefaultSNI:            CloudflareDefaultSNI,
++		DefaultURI:            CloudflareConnectURI,
++		PinPublicKey:          true,
++	}
++}
++
++// ProfileStandard is the strict RFC 9484 profile (for a self-hosted CONNECT-IP
++// server). Kept minimal in v1 — see SPEC 021 phase 3.
++func ProfileStandard() Profile {
++	return Profile{
++		RequestProtocol:       "connect-ip",
++		IgnoreExtendedConnect: false,
++		DefaultSNI:            "",
++		DefaultURI:            "",
++		PinPublicKey:          false,
++	}
++}
++
++// ParseProfile resolves a profile name. Empty defaults to cloudflare.
++func ParseProfile(name string) (Profile, error) {
++	switch name {
++	case "", "cloudflare":
++		return ProfileCloudflare(), nil
++	case "standard":
++		return ProfileStandard(), nil
++	default:
++		return Profile{}, E.New("masque: unknown profile: ", name)
++	}
++}
++
++// PrepareTLSConfig builds the client TLS config for a given profile.
++//
++// For the cloudflare profile it pins the endpoint's ECDSA public key: SNI does
++// not match the endpoint, so normal verification is skipped (InsecureSkipVerify)
++// and VerifyConnection asserts that a presented certificate carries exactly the
++// expected public key. When insecure is true, pinning is disabled entirely.
++func PrepareTLSConfig(profile Profile, privKey *ecdsa.PrivateKey, peerPubKey *ecdsa.PublicKey, sni string, insecure bool) (*tls.Config, error) {
++	tlsConfig := &tls.Config{
++		ServerName: sni,
++		NextProtos: []string{http3.NextProtoH3},
++	}
++
++	if privKey != nil {
++		cert, err := generateClientCert(privKey)
++		if err != nil {
++			return nil, E.Cause(err, "generate client cert")
++		}
++		tlsConfig.Certificates = []tls.Certificate{{
++			Certificate: cert,
++			PrivateKey:  privKey,
++		}}
++	}
++
++	if profile.PinPublicKey && !insecure {
++		if peerPubKey == nil {
++			return nil, errors.New("masque: public key required for pinning")
++		}
++		tlsConfig.InsecureSkipVerify = true
++		tlsConfig.VerifyConnection = func(cs tls.ConnectionState) error {
++			var joined error
++			for _, cert := range cs.PeerCertificates {
++				if err := verifyPinnedCert(cert, peerPubKey); err != nil {
++					joined = errors.Join(joined, err)
++					continue
++				}
++				return nil
++			}
++			if joined == nil {
++				joined = errors.New("masque: no peer certificate to pin")
++			}
++			return joined
++		}
++	} else if insecure {
++		tlsConfig.InsecureSkipVerify = true
++	}
++
++	return tlsConfig, nil
++}
++
++func verifyPinnedCert(cert *x509.Certificate, peerPubKey *ecdsa.PublicKey) error {
++	pub, ok := cert.PublicKey.(*ecdsa.PublicKey)
++	if !ok {
++		// We only support ECDSA endpoint keys (Cloudflare's cert type).
++		return x509.ErrUnsupportedAlgorithm
++	}
++	if !pub.Equal(peerPubKey) {
++		return errors.New("masque: remote endpoint has a different public key than pinned")
++	}
++	return nil
++}
++
++// generateClientCert creates a short-lived self-signed certificate wrapping the
++// client's ECDSA key, presented to the endpoint (Cloudflare Access mTLS).
++func generateClientCert(privKey *ecdsa.PrivateKey) ([][]byte, error) {
++	now := time.Now()
++	template := &x509.Certificate{
++		SerialNumber: big.NewInt(1),
++		NotBefore:    now,
++		NotAfter:     now.Add(24 * time.Hour),
++	}
++	der, err := x509.CreateCertificate(rand.Reader, template, template, &privKey.PublicKey, privKey)
++	if err != nil {
++		return nil, err
++	}
++	return [][]byte{der}, nil
++}
+diff --git a/transport/masque/profile_test.go b/transport/masque/profile_test.go
+new file mode 100644
+index 000000000..f9024a6ee
+--- /dev/null
++++ b/transport/masque/profile_test.go
+@@ -0,0 +1,108 @@
++package masque
++
++import (
++	"crypto/ecdsa"
++	"crypto/elliptic"
++	"crypto/rand"
++	"crypto/x509"
++	"testing"
++
++	"github.com/sagernet/quic-go/http3"
++)
++
++func TestParseProfile(t *testing.T) {
++	t.Parallel()
++	cf, err := ParseProfile("")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if cf.RequestProtocol != "cf-connect-ip" || !cf.IgnoreExtendedConnect || !cf.PinPublicKey {
++		t.Fatalf("empty should default to cloudflare, got %+v", cf)
++	}
++	if cf.DefaultSNI != CloudflareDefaultSNI || cf.DefaultURI != CloudflareConnectURI {
++		t.Fatalf("cloudflare defaults wrong: %+v", cf)
++	}
++	// lx: the endpoint's own name must never be what we send by default — that
++	// is the one name censors match on (SPEC 021).
++	if cf.DefaultSNI == CloudflareConnectSNI {
++		t.Fatal("default SNI must not be the endpoint's own name")
++	}
++
++	std, err := ParseProfile("standard")
++	if err != nil {
++		t.Fatal(err)
++	}
++	if std.RequestProtocol != "connect-ip" || std.IgnoreExtendedConnect || std.PinPublicKey {
++		t.Fatalf("standard profile wrong: %+v", std)
++	}
++
++	if _, err = ParseProfile("bogus"); err == nil {
++		t.Fatal("expected error for unknown profile")
++	}
++}
++
++func TestPrepareTLSConfigPinning(t *testing.T) {
++	t.Parallel()
++	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++	peer, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	cfg, err := PrepareTLSConfig(ProfileCloudflare(), priv, &peer.PublicKey, "example.org", false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !cfg.InsecureSkipVerify {
++		t.Fatal("cloudflare pinning must set InsecureSkipVerify")
++	}
++	if cfg.VerifyConnection == nil {
++		t.Fatal("cloudflare pinning must set VerifyConnection")
++	}
++	if len(cfg.Certificates) != 1 {
++		t.Fatal("client cert must be generated when private key provided")
++	}
++	if len(cfg.NextProtos) != 1 || cfg.NextProtos[0] != http3.NextProtoH3 {
++		t.Fatalf("ALPN should be h3, got %v", cfg.NextProtos)
++	}
++
++	// Standard profile: no pinning, normal verification.
++	stdCfg, err := PrepareTLSConfig(ProfileStandard(), nil, nil, "example.org", false)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if stdCfg.InsecureSkipVerify || stdCfg.VerifyConnection != nil {
++		t.Fatal("standard profile must not pin")
++	}
++
++	// Insecure disables pinning even for cloudflare.
++	insecureCfg, err := PrepareTLSConfig(ProfileCloudflare(), priv, &peer.PublicKey, "example.org", true)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if insecureCfg.VerifyConnection != nil {
++		t.Fatal("insecure must disable VerifyConnection")
++	}
++}
++
++func TestVerifyPinnedCert(t *testing.T) {
++	t.Parallel()
++	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++	other, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
++
++	cert := &x509.Certificate{PublicKey: &priv.PublicKey}
++	if err := verifyPinnedCert(cert, &priv.PublicKey); err != nil {
++		t.Fatalf("matching key should verify: %v", err)
++	}
++	if err := verifyPinnedCert(cert, &other.PublicKey); err == nil {
++		t.Fatal("mismatched key must fail")
++	}
++
++	rsaLike := &x509.Certificate{PublicKey: "not-a-key"}
++	if err := verifyPinnedCert(rsaLike, &priv.PublicKey); err == nil {
++		t.Fatal("non-ECDSA key must be rejected")
++	}
++}

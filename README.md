@@ -1,7 +1,7 @@
 # sing-box-ext-build
 
-> Automated builds of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaWG** support.
-> Code comes straight from upstream sources plus a small patch.
+> Automated builds of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaWG** and **MASQUE** support.
+> Code comes straight from upstream sources plus a set of lightweight patches.
 
 [![Build Status](https://github.com/hb5588973/sing-box-ext-build/actions/workflows/build.yml/badge.svg)](https://github.com/hb5588973/sing-box-ext-build/actions/workflows/build.yml)
 
@@ -13,6 +13,10 @@
 - Applies patches and builds binaries cross-platform with `CGO_ENABLED=0`.
 - Automatically tracks official upstream build tags (never hard-coded).
 - AmneziaWG support is added via the `with_awg` tag.
+- MASQUE CONNECT-IP outbound is compiled unconditionally (requires no build tag).
+
+There is **no auto-registration**: the `masque` outbound must be configured
+explicitly, exactly like any other outbound.
 
 ## Download
 
@@ -40,9 +44,11 @@ The workflow will automatically:
 5. Build with `CGO_ENABLED=0` using upstream's `release/LDFLAGS`.
 6. Publish binaries to the rolling `latest` release.
 
-## Build Tags
+## Build Tags & MASQUE
 
 The tag set is never hard-coded: `release/DEFAULT_BUILD_TAGS_OTHERS` is read from the cloned upstream tree. Only `with_awg` is appended.
+
+MASQUE has **no build tag** — the outbound is compiled unconditionally; there is no `with_masque` tag.
 
 `with_naive_outbound` is intentionally absent: it links `sagernet/cronet-go` and requires a cgo toolchain per platform, which conflicts with CGO-free cross builds. Official macOS releases enable it; these builds do not.
 
@@ -61,8 +67,9 @@ git clone --depth 1 --branch testing https://github.com/SagerNet/sing-box.git
 cd sing-box
 # Apply your patches one by one
 git apply ../../patches/0001-amneziawg.patch
+git apply ../../patches/0002-masque-outbound.patch
 # If conflicts occur, fix them, then generate a new patch:
-git diff > ../../patches/0001-amneziawg.patch
+git diff > ../../patches/0002-masque-outbound.patch
 
 # 3. Push the updated patches back to your fork
 cd ../..
@@ -76,5 +83,6 @@ git push
 ```
 patches/
   0001-amneziawg.patch        option + transport/wireguard AWG support, go.mod replace
+  0002-masque-outbound.patch  MASQUE outbound, connectip package, registration
 .github/workflows/build.yml
 ```

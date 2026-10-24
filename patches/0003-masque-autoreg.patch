@@ -1,5 +1,5 @@
 diff --git a/cmd/sing-box/cmd_run.go b/cmd/sing-box/cmd_run.go
-index fecd99a0c..52b64859f 100644
+index fecd99a0c..7afd54f30 100644
 --- a/cmd/sing-box/cmd_run.go
 +++ b/cmd/sing-box/cmd_run.go
 @@ -2,7 +2,9 @@ package main
@@ -28,7 +28,7 @@ index fecd99a0c..52b64859f 100644
  	options, err := json.UnmarshalExtendedContext[option.Options](globalCtx, configContent)
  	if err != nil {
  		return nil, E.Cause(err, "decode config at ", path)
-@@ -69,6 +73,71 @@ func readConfigAt(path string) (*OptionsEntry, error) {
+@@ -69,6 +73,111 @@ func readConfigAt(path string) (*OptionsEntry, error) {
  	}, nil
  }
  
@@ -41,11 +41,20 @@ index fecd99a0c..52b64859f 100644
 +// on first use and merges the generated outbounds into the config, in memory
 +// only. Any failure is logged and the config is loaded unchanged, so sing-box
 +// still starts without network access or a writable executable directory.
++//
++// When a configuration directory is used (-C/--config-directory), sing-box loads
++// <exe_dir>/proxies/warp-wg.json itself; injecting it here as well would
++// duplicate the outbound tags during merge.
 +func injectMasqueOutboundsOnce(configContent []byte) []byte {
 +	if masqueAutoregDone {
 +		return configContent
 +	}
 +	masqueAutoregDone = true
++
++	if len(configDirectories) > 0 || hasConfigDirectoryFlag(os.Args[1:]) {
++		slog.Info("masque: detected -C flag, skipping injection to avoid tag conflict")
++		return configContent
++	}
 +
 +	exePath, err := os.Executable()
 +	if err != nil {
@@ -76,17 +85,34 @@ index fecd99a0c..52b64859f 100644
 +		slog.Error("masque: parse fragment failed", "err", err)
 +		return configContent
 +	}
++
 +	newOutbounds, _ := fragConf["outbounds"].([]any)
 +	if len(newOutbounds) == 0 {
 +		return configContent
 +	}
 +	userOutbounds, _ := userConf["outbounds"].([]any)
++	// A user-provided masque outbound wins: never add a second one.
 +	for _, outbound := range userOutbounds {
 +		if m, ok := outbound.(map[string]any); ok && m["type"] == "masque" {
 +			slog.Info("masque: config already has a masque outbound, skipping injection")
 +			return configContent
 +		}
 +	}
++	// Even for other outbound types, a tag collision would fail the merge.
++	for _, newOutbound := range newOutbounds {
++		newMap, _ := newOutbound.(map[string]any)
++		newTag, _ := newMap["tag"].(string)
++		if newTag == "" {
++			continue
++		}
++		for _, outbound := range userOutbounds {
++			if m, ok := outbound.(map[string]any); ok && m["tag"] == newTag {
++				slog.Info("masque: outbound tag already exists in config, skipping injection")
++				return configContent
++			}
++		}
++	}
++
 +	userConf["outbounds"] = append(userOutbounds, newOutbounds...)
 +	newBytes, err := stdjson.MarshalIndent(userConf, "", "  ")
 +	if err != nil {
@@ -95,6 +121,20 @@ index fecd99a0c..52b64859f 100644
 +	}
 +	slog.Info("masque: injected masque outbounds", "count", len(newOutbounds))
 +	return newBytes
++}
++
++// hasConfigDirectoryFlag reports whether -C/--config-directory is present on the
++// command line, including the "-C=dir" and "--config-directory=dir" forms.
++func hasConfigDirectoryFlag(args []string) bool {
++	for _, arg := range args {
++		switch {
++		case arg == "-C", arg == "--config-directory":
++			return true
++		case strings.HasPrefix(arg, "-C="), strings.HasPrefix(arg, "--config-directory="):
++			return true
++		}
++	}
++	return false
 +}
 +
  func readConfig() ([]*OptionsEntry, error) {

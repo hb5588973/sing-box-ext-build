@@ -1,7 +1,7 @@
 # sing-box-ext-build
 
-> Automated builds of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaWG** and **MASQUE** support.
-> Code comes straight from upstream sources plus a set of lightweight patches.
+> Automated builds of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaWG** support.
+> Code comes straight from upstream sources plus a small patch.
 
 [![Build Status](https://github.com/hb5588973/sing-box-ext-build/actions/workflows/build.yml/badge.svg)](https://github.com/hb5588973/sing-box-ext-build/actions/workflows/build.yml)
 
@@ -12,8 +12,7 @@
 - Fetches the latest `testing` branch from upstream every day.
 - Applies patches and builds binaries cross-platform with `CGO_ENABLED=0`.
 - Automatically tracks official upstream build tags (never hard-coded).
-- AmneziaWG support is added via `with_awg` tag.
-- MASQUE CONNECT-IP outbound is compiled unconditionally (requires no build tag).
+- AmneziaWG support is added via the `with_awg` tag.
 
 ## Download
 
@@ -41,11 +40,9 @@ The workflow will automatically:
 5. Build with `CGO_ENABLED=0` using upstream's `release/LDFLAGS`.
 6. Publish binaries to the rolling `latest` release.
 
-## Build Tags & MASQUE
+## Build Tags
 
 The tag set is never hard-coded: `release/DEFAULT_BUILD_TAGS_OTHERS` is read from the cloned upstream tree. Only `with_awg` is appended.
-
-MASQUE has **no build tag** — the outbound is compiled unconditionally; the workflow asserts its sources are present instead of asserting a non-existent `with_masque` tag.
 
 `with_naive_outbound` is intentionally absent: it links `sagernet/cronet-go` and requires a cgo toolchain per platform, which conflicts with CGO-free cross builds. Official macOS releases enable it; these builds do not.
 
@@ -74,31 +71,10 @@ git commit -m "fix: update patches for upstream changes"
 git push
 ```
 
-## MASQUE auto-registration
-
-The `0003-masque-autoreg` patch makes `sing-box run` / `check` bootstrap a
-Cloudflare WARP MASQUE account without any `masque` entry in the config:
-
-1. if `<exe_dir>/warp-masque-account.json` is missing, a WARP device is registered;
-2. the derived outbounds are written to `<exe_dir>/proxies/warp-wg.json`
-   (tags `warp-masque-1`, `warp-masque-2`);
-3. on the first config read, they are merged into the in-memory config before it is
-   decoded — the config file itself is never modified.
-
-A config that already declares a `type: "masque"` outbound is left untouched, and a
-failed registration is logged while sing-box starts with the original config. Route
-to the injected nodes by tag:
-
-```json
-{"route": {"rules": [{"outbound": "warp-masque-1", "network": ["tcp", "udp"]}]}}
-```
-
 ## Layout
 
 ```
 patches/
   0001-amneziawg.patch        option + transport/wireguard AWG support, go.mod replace
-  0002-masque-outbound.patch  MASQUE outbound, connectip package, registration
-  0003-masque-autoreg.patch   WARP auto-registration + in-memory outbound injection
 .github/workflows/build.yml
 ```

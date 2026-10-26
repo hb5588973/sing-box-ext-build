@@ -100,7 +100,7 @@ jobs:
           BASE_TAGS="$(cat release/DEFAULT_BUILD_TAGS_OTHERS)"
           LDFLAGS_SHARED="$(cat release/LDFLAGS)"
           go build -v -trimpath \
-            -tags "${BASE_TAGS},with_awg" \
+            -tags "${BASE_TAGS},with_awg,with_xhttp" \
             -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=build-${{ github.run_number }}' ${LDFLAGS_SHARED} -s -w" \
             -o "$GITHUB_WORKSPACE/dist/sing-box-${{ matrix.name }}" \
             ./cmd/sing-box

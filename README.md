@@ -1,6 +1,6 @@
 # sing-box-ext-build
 
-> Automated builds of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaWG** and **MASQUE** support.
+> Automated builds of [SagerNet/sing-box](https://github.com/SagerNet/sing-box) with **AmneziaWG**, **MASQUE** and **XHTTP** support.
 > Code comes straight from upstream sources plus a set of lightweight patches.
 
 [![Build Status](https://github.com/hb5588973/sing-box-ext-build/actions/workflows/build.yml/badge.svg)](https://github.com/hb5588973/sing-box-ext-build/actions/workflows/build.yml)
@@ -14,6 +14,7 @@
 - Automatically tracks official upstream build tags (never hard-coded).
 - AmneziaWG support is added via the `with_awg` tag.
 - MASQUE CONNECT-IP outbound is compiled unconditionally (requires no build tag).
+- XHTTP client transport (`type: "xhttp"`) is built with `with_xhttp`.
 
 There is **no auto-registration**: the `masque` outbound must be configured
 explicitly, exactly like any other outbound.
@@ -40,13 +41,13 @@ The workflow will automatically:
 1. Clone `SagerNet/sing-box@testing`.
 2. Clone `wireguard-go-awg` into `src/submodules/wireguard-go` (local module replacement).
 3. Apply `patches/*.patch` (`git apply --check` fails fast on conflicts).
-4. Read `src/release/DEFAULT_BUILD_TAGS_OTHERS` from upstream, append `with_awg`.
+4. Read `src/release/DEFAULT_BUILD_TAGS_OTHERS` from upstream, append `with_awg` and `with_xhttp`.
 5. Build with `CGO_ENABLED=0` using upstream's `release/LDFLAGS`.
 6. Publish binaries to the rolling `latest` release.
 
 ## Build Tags & MASQUE
 
-The tag set is never hard-coded: `release/DEFAULT_BUILD_TAGS_OTHERS` is read from the cloned upstream tree. Only `with_awg` is appended.
+The tag set is never hard-coded: `release/DEFAULT_BUILD_TAGS_OTHERS` is read from the cloned upstream tree. Only `with_awg` and `with_xhttp` are appended (`with_quic` is already part of the upstream set).
 
 MASQUE has **no build tag** — the outbound is compiled unconditionally; there is no `with_masque` tag.
 
@@ -68,6 +69,7 @@ cd sing-box
 # Apply your patches one by one
 git apply ../../patches/0001-amneziawg.patch
 git apply ../../patches/0002-masque-outbound.patch
+git apply ../../patches/0003-xhttp-client.patch
 # If conflicts occur, fix them, then generate a new patch:
 git diff > ../../patches/0002-masque-outbound.patch
 
@@ -84,5 +86,6 @@ git push
 patches/
   0001-amneziawg.patch        option + transport/wireguard AWG support, go.mod replace
   0002-masque-outbound.patch  MASQUE outbound, connectip package, registration
+  0003-xhttp-client.patch     XHTTP client transport (HTTP/1.1, HTTP/2, HTTP/3, XMUX)
 .github/workflows/build.yml
 ```

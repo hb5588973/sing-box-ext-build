@@ -68,8 +68,39 @@ sing-box check -c xhttp-config.json                              # ok (with with
 sing-box check -c xhttp-config.json                              # unknown transport type: xhttp (without the tag)
 ```
 
+## Live node results
+
+Run locally with a binary built from the three-patch tree
+(`-tags "with_quic with_utls with_xhttp"`), one node per sing-box process,
+`http://cp.cloudflare.com/generate_204` through the mixed inbound:
+
+| # | Node | Result |
+|---|---|---|
+| 0 | xhttp-h1.1-cdn (skk.moe) | OK, 204 |
+| 1 | xhttp-h2-reality (154.40.49.226:30001) | FAIL: `reality verification failed` |
+| 2 | xhttp-h3-direct (154.40.49.226:30002) | OK, 204 (HTTP/3 path) |
+| 3 | hax xhttp-h1.1-cdn | OK, 204 |
+| 4 | hax xhttp-h2-reality | FAIL: `reality verification failed` |
+| 5 | hax xhttp-h3-direct | OK, 204 |
+
+The two REALITY nodes fail during the REALITY handshake while the other node on
+the same host (h3, port 30002) succeeds, so the transport itself works; the
+REALITY mismatch is either server-side or a divergence between this baseline and
+the lx tree (lx carries additional REALITY/VLESS changes that are out of scope
+here).
+
+MASQUE coexistence was verified at registration level (`type: masque` reaches the
+MASQUE option validation instead of `unknown outbound type`), and the CI build
+includes `with_awg`; no live MASQUE/AWG dial was repeated in this run.
+
+CI artifact download was blocked by the local network (release CDN timeout), so
+the live tests used a locally built binary from the same three-patch tree; CI
+itself passed on all 11 targets (`build-25`).
+
 ## Known limitations
 
 - HTTP/3 tests require `with_quic`; the stub build rejects `h3` at dial time.
 - The removed badh2 layer means `http2.StreamError` is no longer masked; callers
   see the raw error (same as upstream sing-box transports).
+- REALITY + XHTTP currently fails verification against the two sample nodes (see
+  above).

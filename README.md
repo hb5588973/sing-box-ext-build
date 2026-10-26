@@ -15,6 +15,8 @@
 - AmneziaWG support is added via the `with_awg` tag.
 - MASQUE CONNECT-IP outbound is compiled unconditionally (requires no build tag).
 - XHTTP client transport (`type: "xhttp"`) is built with `with_xhttp`.
+- REALITY client supports `tls.reality.key_share` (`hybrid`/`classical`) and applies
+  `fragment` / `record_fragment` on the REALITY path.
 
 There is **no auto-registration**: the `masque` outbound must be configured
 explicitly, exactly like any other outbound.
@@ -70,6 +72,7 @@ cd sing-box
 git apply ../../patches/0001-amneziawg.patch
 git apply ../../patches/0002-masque-outbound.patch
 git apply ../../patches/0003-xhttp-client.patch
+git apply ../../patches/0004-reality-compat.patch
 # If conflicts occur, fix them, then generate a new patch:
 git diff > ../../patches/0002-masque-outbound.patch
 
@@ -87,5 +90,6 @@ patches/
   0001-amneziawg.patch        option + transport/wireguard AWG support, go.mod replace
   0002-masque-outbound.patch  MASQUE outbound, connectip package, registration
   0003-xhttp-client.patch     XHTTP client transport (HTTP/1.1, HTTP/2, HTTP/3, XMUX)
+  0004-reality-compat.patch   REALITY key_share (hybrid/classical), fragment, minClientVer
 .github/workflows/build.yml
 ```

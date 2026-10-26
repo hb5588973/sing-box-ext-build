@@ -68,39 +68,58 @@ sing-box check -c xhttp-config.json                              # ok (with with
 sing-box check -c xhttp-config.json                              # unknown transport type: xhttp (without the tag)
 ```
 
+## REALITY compatibility (0004)
+
+`0004-reality-compat.patch` ports the REALITY client fixes:
+
+- `tls.reality.key_share` option: `""` keeps the fingerprint's preset, `"classical"`
+  strips `X25519MLKEM768` (old upstream behaviour, for older servers), `"hybrid"`
+  requires the post-quantum share that Xray >= 26.9.8 expects.
+- The upstream client no longer strips `X25519MLKEM768` unconditionally; AuthKey is
+  computed from the plain X25519 share when present, otherwise from the X25519 part
+  of the hybrid share (`MlkemEcdhe`).
+- The REALITY ClientHello announces Xray's `minClientVer` (26.3.27) instead of
+  `1.8.1`; newer servers silently proxy to the decoy destination without it.
+- `fragment` / `record_fragment` are now applied to the REALITY path (the ClientHello
+  goes through the same wrapper as the plain uTLS client).
+- `short_id` longer than 16 hex characters is rejected at load time.
+
+The default (`key_share: ""`) is enough for the sample nodes because the `chrome`
+fingerprint already carries the hybrid share; set `"classical"` only for servers
+older than Xray 26.9.8, and `"hybrid"` to fail fast when a fingerprint lacks it.
+
 ## Live node results
 
-Run locally with a binary built from the three-patch tree
+Run locally with a binary built from the four-patch tree
 (`-tags "with_quic with_utls with_xhttp"`), one node per sing-box process,
-`http://cp.cloudflare.com/generate_204` through the mixed inbound:
+`http://cp.cloudflare.com/generate_204` through the mixed inbound. REALITY nodes
+were run with `tls.reality.key_share: "hybrid"`:
 
 | # | Node | Result |
 |---|---|---|
 | 0 | xhttp-h1.1-cdn (skk.moe) | OK, 204 |
-| 1 | xhttp-h2-reality (154.40.49.226:30001) | FAIL: `reality verification failed` |
+| 1 | xhttp-h2-reality (154.40.49.226:30001) | OK, 204 |
 | 2 | xhttp-h3-direct (154.40.49.226:30002) | OK, 204 (HTTP/3 path) |
 | 3 | hax xhttp-h1.1-cdn | OK, 204 |
-| 4 | hax xhttp-h2-reality | FAIL: `reality verification failed` |
+| 4 | hax xhttp-h2-reality | OK, 204 |
 | 5 | hax xhttp-h3-direct | OK, 204 |
 
-The two REALITY nodes fail during the REALITY handshake while the other node on
-the same host (h3, port 30002) succeeds, so the transport itself works; the
-REALITY mismatch is either server-side or a divergence between this baseline and
-the lx tree (lx carries additional REALITY/VLESS changes that are out of scope
-here).
+Additional policy checks on node 1: default (`key_share` absent) also succeeds
+because the fingerprint carries the hybrid share; `classical` fails as expected
+(`502`, server rejects the classical-only hello).
 
 MASQUE coexistence was verified at registration level (`type: masque` reaches the
 MASQUE option validation instead of `unknown outbound type`), and the CI build
 includes `with_awg`; no live MASQUE/AWG dial was repeated in this run.
 
 CI artifact download was blocked by the local network (release CDN timeout), so
-the live tests used a locally built binary from the same three-patch tree; CI
-itself passed on all 11 targets (`build-25`).
+the live tests used a locally built binary from the same four-patch tree; CI
+itself passed on all 11 targets.
 
 ## Known limitations
 
 - HTTP/3 tests require `with_quic`; the stub build rejects `h3` at dial time.
 - The removed badh2 layer means `http2.StreamError` is no longer masked; callers
   see the raw error (same as upstream sing-box transports).
-- REALITY + XHTTP currently fails verification against the two sample nodes (see
-  above).
+- `tls.reality.key_share: "classical"` does not work against servers on Xray
+  >= 26.9.8; leave it empty (default) unless an older server requires it.

@@ -57,6 +57,7 @@ jobs:
           - { goos: linux, goarch: mips,     goarm: "",  name: linux-mips-softfloat,     gomips: softfloat }
           - { goos: linux, goarch: mips64le, goarm: "",  name: linux-mips64le-softfloat, gomips64: softfloat }
           - { goos: linux, goarch: mips64,   goarm: "",  name: linux-mips64-softfloat,   gomips64: softfloat }
+          - { goos: darwin, goarch: amd64,   goarm: "",  name: darwin-amd64 }
           - { goos: darwin, goarch: arm64,   goarm: "",  name: darwin-arm64 }
           - { goos: windows, goarch: amd64,  goarm: "",  name: windows-amd64.exe }
     steps:

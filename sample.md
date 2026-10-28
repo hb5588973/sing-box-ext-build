@@ -155,15 +155,29 @@ Standard WireGuard outbound (single-peer form):
 
 ```json
 {
-  "type": "wireguard",
-  "tag": "wg-out",
-  "server": "EXAMPLE.COM",
-  "server_port": 51820,
-  "local_address": ["10.0.0.2/32"],
-  "private_key": "PRIVATE_KEY",
-  "peer_public_key": "PEER_PUBLIC_KEY",
-  "pre_shared_key": "",
-  "mtu": 1408
+  "endpoints": [
+    {
+      "type": "wireguard",
+      "tag": "warp-awg-1",
+      "address": ["172.16.0.2/32"],
+      "private_key": "PRIVATE_KEY",
+      "mtu": 1280,
+      "system": false,
+      "peers": [
+        {
+          "address": "PEER_HOST",
+          "port": 2408,
+          "public_key": "PEER_PUBLIC_KEY",
+          "allowed_ips": ["0.0.0.0/0"],
+          "persistent_keepalive_interval": 25
+        }
+      ],
+      "jc": 6, "jmin": 10, "jmax": 50,
+      "s1": 0, "s2": 0, "s3": 0, "s4": 0,
+      "h1": 1, "h2": 2, "h3": 3, "h4": 4,
+      "i1": "<r 2><b 0x...>"
+    }
+  ]
 }
 ```
 
@@ -187,7 +201,6 @@ Based on your converter's mapping logic, an approximate format is:
   "public_key": "PUBLIC_KEY",
   "ip": "172.16.0.2/32",
   "mtu": 1280,
-  "vhttp": "auto",
   "profile": "cloudflare",
   "tls": { "enabled": true, "server_name": "consumer-masque.cloudflareclient.com" }
 }
